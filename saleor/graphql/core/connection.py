@@ -15,11 +15,12 @@ from graphql_relay.connection.connectiontypes import Edge, PageInfo
 from graphql_relay.utils import base64, unbase64
 
 from ...channel.exceptions import ChannelNotDefined, NoDefaultChannel
-from ..channel import ChannelContext, ChannelQsContext
 from ..channel.utils import get_default_channel_slug_or_graphql_error
+from ..core.context import ChannelContext, ChannelQsContext
 from ..core.enums import OrderDirection
 from ..core.types import BaseConnection, NonNullList
 from ..utils.sorting import sort_queryset_for_connection
+from .context import SyncWebhookControlContext
 
 if TYPE_CHECKING:
     from ..core import ResolveInfo
@@ -646,6 +647,22 @@ def _handle_or_filter_input(
     return queryset
 
 
+def create_connection_slice_for_sync_webhook_control_context(
+    iterable, info: "ResolveInfo", args, connection_type, allow_sync_webhooks
+):
+    edges_with_context = []
+    sliced_connection = create_connection_slice(iterable, info, args, connection_type)
+
+    for edge in sliced_connection.edges:
+        node = edge.node
+        edge.node = SyncWebhookControlContext(
+            node=node, allow_sync_webhooks=allow_sync_webhooks
+        )
+        edges_with_context.append(edge)
+    sliced_connection.edges = edges_with_context
+    return sliced_connection
+
+
 # TODO: needs optimization
 # def _handle_not_filter_input(filter_input, queryset, args, filterset_class, request):
 #     if contains_filter_operator(filter_input):
@@ -661,7 +678,7 @@ class NonNullConnection(BaseConnection):
         abstract = True
 
     @classmethod
-    def __init_subclass_with_meta__(cls, node=None, name=None, **options):
+    def __init_subclass_with_meta__(cls, node=None, name=None, **options):  # type: ignore[override]
         super().__init_subclass_with_meta__(node=node, name=name, **options)
 
         # Override the original EdgeBase type to make to `node` field required.

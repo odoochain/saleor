@@ -1,8 +1,8 @@
 import datetime
+import logging
 from collections.abc import Iterable
 from typing import Any
 
-from celery.utils.log import get_task_logger
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
@@ -20,7 +20,7 @@ from ..core import SaleorContext
 from ..core.dataloaders import DataLoader
 from ..utils import format_error
 
-logger = get_task_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def initialize_request(
@@ -63,6 +63,38 @@ def get_event_payload(event):
     if isinstance(event, Promise):
         return event.get()
     return event
+
+
+def _process_payload_instance_async(
+    payload_instance,
+) -> Promise[dict[str, Any]] | dict[str, Any]:
+    """Process a payload instance to extract data."""
+    ((key, value),) = payload_instance.data.items()
+
+    def process_single_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+        # When a subscription is defined with "event" as its root field,
+        # the data is returned directly. This issue has been resolved for
+        # subscriptions whose root field is not "event".
+        if "event" == key:
+            return data or {}
+        return {"data": {key: data}}
+
+    if isinstance(value, Promise):
+        return value.then(process_single_payload)
+    return process_single_payload(value)
+
+
+def _process_payload_instance(payload_instance):
+    """Process a payload instance to extract data."""
+    for payload_key in payload_instance.data:
+        extracted_payload = get_event_payload(payload_instance.data.get(payload_key))
+        payload_instance.data[payload_key] = extracted_payload
+    if "event" in payload_instance.data or not payload_instance.data:
+        event_payload = payload_instance.data.get("event") or {}
+    else:
+        event_payload = {"data": payload_instance.data}
+
+    return event_payload
 
 
 def generate_payload_promise_from_subscription(
@@ -124,12 +156,18 @@ def generate_payload_promise_from_subscription(
         if not payload:
             logger.warning(
                 "Subscription did not return a payload.",
-                extra={"query": subscription_query, "app": app_id},
+                extra={
+                    "query": subscription_query,
+                    "app": app_id,
+                    "event_type": event_type,
+                },
             )
             return None
 
         payload_instance = payload[0]
-        event_payload = payload_instance.data.get("event") or {}
+        event_payload: Promise[dict[str, Any]] | dict[str, Any] = (
+            _process_payload_instance_async(payload_instance)
+        )
 
         def check_errors(event_payload, payload_instance=payload_instance):
             if payload_instance.errors:
@@ -202,20 +240,16 @@ def generate_payload_from_subscription(
     if not payload:
         logger.warning(
             "Subscription did not return a payload.",
-            extra={"query": subscription_query, "app": app_id},
+            extra={
+                "query": subscription_query,
+                "app": app_id,
+                "event_type": event_type,
+            },
         )
         return None
 
     payload_instance = payload[0]
-    payload_data_keys = payload_instance.data.keys()
-    for key in payload_data_keys:
-        extracted_payload = get_event_payload(payload_instance.data.get(key))
-        payload_instance.data[key] = extracted_payload
-    if "event" in payload_instance.data or not payload_instance.data:
-        event_payload = payload_instance.data.get("event") or {}
-    else:
-        event_payload = {"data": payload_instance.data}
-
+    event_payload = _process_payload_instance(payload_instance)
     if payload_instance.errors:
         event_payload["errors"] = [
             format_error(error, (GraphQLError, PermissionDenied))

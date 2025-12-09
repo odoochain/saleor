@@ -4,10 +4,11 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from decimal import Decimal
 from functools import partial
-from typing import TYPE_CHECKING, Any, Final, Optional, Union
+from typing import TYPE_CHECKING, Any, Final, Optional, Union, cast
 
 import graphene
 from django.conf import settings
+from pydantic import ValidationError
 
 from ...app.models import App
 from ...channel.models import Channel
@@ -16,9 +17,11 @@ from ...checkout.models import Checkout
 from ...core import EventDeliveryStatus
 from ...core.models import EventDelivery
 from ...core.notify import NotifyEventType
-from ...core.taxes import TaxData, TaxType
-from ...core.utils import build_absolute_uri
+from ...core.taxes import TAX_ERROR_FIELD_LENGTH, TaxData, TaxDataError, TaxType
+from ...core.telemetry import get_task_context
+from ...core.utils import build_absolute_uri, get_domain
 from ...core.utils.json_serializer import CustomJsonEncoder
+from ...core.utils.text import safe_truncate
 from ...csv.notifications import get_default_export_payload
 from ...graphql.core.context import SaleorContext
 from ...graphql.webhook.subscription_payload import (
@@ -29,9 +32,11 @@ from ...graphql.webhook.utils import (
     get_pregenerated_subscription_payload,
     get_subscription_query_hash,
 )
+from ...order.models import Order
 from ...payment import PaymentError, TransactionKind
 from ...payment.interface import (
     GatewayResponse,
+    JSONValue,
     ListStoredPaymentMethodsRequestData,
     PaymentData,
     PaymentGateway,
@@ -57,7 +62,7 @@ from ...payment.utils import (
 )
 from ...settings import WEBHOOK_SYNC_TIMEOUT
 from ...thumbnail.models import Thumbnail
-from ...webhook.const import WEBHOOK_CACHE_DEFAULT_TIMEOUT
+from ...webhook.const import WEBHOOK_CACHE_DEFAULT_TTL
 from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ...webhook.payloads import (
     generate_checkout_payload,
@@ -87,8 +92,13 @@ from ...webhook.payloads import (
     generate_transaction_session_payload,
     generate_translation_payload,
 )
+from ...webhook.response_schemas.transaction import (
+    PaymentGatewayInitializeSessionSchema,
+)
+from ...webhook.response_schemas.utils.helpers import parse_validation_error
 from ...webhook.transport.asynchronous.transport import (
     WebhookPayloadData,
+    get_queue_name_for_webhook,
     send_webhook_request_async,
     trigger_webhooks_async,
     trigger_webhooks_async_for_multiple_objects,
@@ -101,28 +111,33 @@ from ...webhook.transport.list_stored_payment_methods import (
     get_response_for_stored_payment_method_request_delete,
     invalidate_cache_for_stored_payment_methods,
 )
+from ...webhook.transport.payment import (
+    parse_list_payment_gateways_response,
+    parse_payment_action_response,
+)
 from ...webhook.transport.shipping import (
     get_cache_data_for_shipping_list_methods_for_checkout,
     get_excluded_shipping_data,
     parse_list_shipping_methods_response,
 )
 from ...webhook.transport.synchronous.transport import (
-    trigger_all_webhooks_sync,
+    trigger_taxes_all_webhooks_sync,
     trigger_transaction_request,
     trigger_webhook_sync,
     trigger_webhook_sync_if_not_cached,
 )
-from ...webhook.transport.utils import (
+from ...webhook.transport.taxes import (
     DEFAULT_TAX_CODE,
     DEFAULT_TAX_DESCRIPTION,
+    get_current_tax_app,
+    parse_tax_data,
+)
+from ...webhook.transport.utils import (
     delivery_update,
     from_payment_app_id,
-    get_current_tax_app,
     get_meta_code_key,
     get_meta_description_key,
-    parse_list_payment_gateways_response,
-    parse_payment_action_response,
-    parse_tax_data,
+    get_sqs_message_group_id,
 )
 from ...webhook.utils import get_webhooks_for_event
 from ..base_plugin import BasePlugin, ExcludedShippingMethod
@@ -158,7 +173,6 @@ if TYPE_CHECKING:
 # time labels were valid for when checking documentation for the carriers
 # (FedEx, UPS, TNT, DHL).
 CACHE_TIME_SHIPPING_LIST_METHODS_FOR_CHECKOUT: Final[int] = 3600 * 12
-
 
 logger = logging.getLogger(__name__)
 
@@ -773,18 +787,17 @@ class WebhookPlugin(BasePlugin):
         )
         return previous_value
 
-    def _get_webhooks_for_order_events(
+    def _get_webhooks_for_channel_events(
         self,
         event_type: str,
-        order: "Order",
+        channel_slug: str,
         webhooks: Iterable["Webhook"] | None = None,
     ) -> Iterable["Webhook"]:
-        """Get webhooks for order events.
+        """Get webhooks for channel-based events.
 
         Fetch all valid webhooks and filter out the ones that have a subscription query
-        with filter that doesn't match to the order.
+        with filter that doesn't match to the channel.
         """
-        order_channel_slug = order.channel.slug
         if webhooks is None:
             webhooks = get_webhooks_for_event(event_type)
         filtered_webhooks = []
@@ -796,7 +809,7 @@ class WebhookPlugin(BasePlugin):
             if not filterable_channel_slugs:
                 filtered_webhooks.append(webhook)
                 continue
-            if order_channel_slug in filterable_channel_slugs:
+            if channel_slug in filterable_channel_slugs:
                 filtered_webhooks.append(webhook)
         return filtered_webhooks
 
@@ -806,7 +819,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_CREATED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -906,7 +921,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_CONFIRMED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -927,7 +944,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_FULLY_PAID
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -946,7 +965,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_PAID
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -967,7 +988,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_REFUNDED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -988,7 +1011,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_FULLY_REFUNDED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1009,7 +1034,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_UPDATED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1030,7 +1057,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_EXPIRED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1350,7 +1379,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_CANCELLED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1371,7 +1402,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_FULFILLED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1392,7 +1425,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.ORDER_METADATA_UPDATED
-        webhooks = self._get_webhooks_for_order_events(event_type, order, webhooks)
+        webhooks = self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        )
         self._trigger_metadata_updated_event(
             event_type,
             order,
@@ -1457,7 +1492,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.DRAFT_ORDER_CREATED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1478,7 +1515,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.DRAFT_ORDER_UPDATED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -1499,7 +1538,9 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.DRAFT_ORDER_DELETED
-        if webhooks := self._get_webhooks_for_order_events(event_type, order, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, order.channel.slug, webhooks
+        ):
             order_data_generator = partial(
                 generate_order_payload, order, self.requestor
             )
@@ -2039,9 +2080,13 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.CHECKOUT_CREATED
-        if webhooks := self._get_webhooks_for_event(event_type, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, checkout.channel.slug, webhooks
+        ):
             checkout_data_generator = partial(
-                generate_checkout_payload, checkout, self.requestor
+                generate_checkout_payload,
+                checkout,
+                self.requestor,
             )
             self.trigger_webhooks_async(
                 None,
@@ -2060,9 +2105,38 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.CHECKOUT_UPDATED
-        if webhooks := self._get_webhooks_for_event(event_type, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, checkout.channel.slug, webhooks
+        ):
             checkout_data_generator = partial(
-                generate_checkout_payload, checkout, self.requestor
+                generate_checkout_payload,
+                checkout,
+                self.requestor,
+            )
+            self.trigger_webhooks_async(
+                None,
+                event_type,
+                webhooks,
+                checkout,
+                self.requestor,
+                legacy_data_generator=checkout_data_generator,
+                queue=settings.CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
+            )
+        return previous_value
+
+    def checkout_fully_authorized(
+        self, checkout: "Checkout", previous_value: None, webhooks=None
+    ) -> None:
+        if not self.active:
+            return previous_value
+        event_type = WebhookEventAsyncType.CHECKOUT_FULLY_AUTHORIZED
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, checkout.channel.slug, webhooks
+        ):
+            checkout_data_generator = partial(
+                generate_checkout_payload,
+                checkout,
+                self.requestor,
             )
             self.trigger_webhooks_async(
                 None,
@@ -2081,9 +2155,13 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         event_type = WebhookEventAsyncType.CHECKOUT_FULLY_PAID
-        if webhooks := self._get_webhooks_for_event(event_type, webhooks):
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, checkout.channel.slug, webhooks
+        ):
             checkout_data_generator = partial(
-                generate_checkout_payload, checkout, self.requestor
+                generate_checkout_payload,
+                checkout,
+                self.requestor,
             )
             self.trigger_webhooks_async(
                 None,
@@ -2101,9 +2179,13 @@ class WebhookPlugin(BasePlugin):
     ) -> None:
         if not self.active:
             return previous_value
-        self._trigger_metadata_updated_event(
-            WebhookEventAsyncType.CHECKOUT_METADATA_UPDATED, checkout, webhooks=webhooks
-        )
+        event_type = WebhookEventAsyncType.CHECKOUT_METADATA_UPDATED
+        if webhooks := self._get_webhooks_for_channel_events(
+            event_type, checkout.channel.slug, webhooks
+        ):
+            self._trigger_metadata_updated_event(
+                event_type, checkout, webhooks=webhooks
+            )
         return previous_value
 
     def notify(
@@ -2668,7 +2750,19 @@ class WebhookPlugin(BasePlugin):
         if not self.active:
             return previous_value
         delivery_update(delivery, status=EventDeliveryStatus.PENDING)
-        send_webhook_request_async.delay(delivery.pk)
+        webhook = delivery.webhook
+        message_group_id = get_sqs_message_group_id(get_domain(), webhook.app)
+        send_webhook_request_async.apply_async(
+            kwargs={
+                "event_delivery_id": delivery.pk,
+                "telemetry_context": get_task_context().to_dict(),
+            },
+            queue=get_queue_name_for_webhook(
+                webhook,
+                default_queue=settings.WEBHOOK_CELERY_QUEUE_NAME,
+            ),
+            MessageGroupId=message_group_id,  # for AWS SQS fair queues
+        )
         return previous_value
 
     def stored_payment_method_request_delete(
@@ -2749,7 +2843,7 @@ class WebhookPlugin(BasePlugin):
                     self.allow_replica,
                     subscribable_object=list_payment_method_data,
                     request_timeout=WEBHOOK_SYNC_TIMEOUT,
-                    cache_timeout=WEBHOOK_CACHE_DEFAULT_TIMEOUT,
+                    cache_timeout=WEBHOOK_CACHE_DEFAULT_TTL,
                     requestor=self.requestor,
                 )
                 if response_data:
@@ -3082,9 +3176,22 @@ class WebhookPlugin(BasePlugin):
         error_msg = None
         if response_data is None:
             error_msg = "Unable to process a payment gateway response."
+
+        response_data_model = None
+        if response_data:
+            try:
+                response_data_model = (
+                    PaymentGatewayInitializeSessionSchema.model_validate(response_data)
+                )
+            except ValidationError as e:
+                response_data = None
+                error_msg = str(e)
+
+        data = response_data_model.data if response_data_model else None
+        data = cast(JSONValue, data)
         response_gateway[webhook.app.identifier] = PaymentGatewayData(
             app_identifier=webhook.app.identifier,
-            data=response_data,
+            data=data,
             error=error_msg,
         )
 
@@ -3387,9 +3494,10 @@ class WebhookPlugin(BasePlugin):
         event_type: str,
         app_identifier: str,
         payload_gen: Callable,
+        expected_lines_count: int,
         subscriptable_object=None,
         pregenerated_subscription_payloads: dict | None = None,
-    ):
+    ) -> TaxData:
         if pregenerated_subscription_payloads is None:
             pregenerated_subscription_payloads = {}
         app = (
@@ -3402,14 +3510,14 @@ class WebhookPlugin(BasePlugin):
             .first()
         )
         if app is None:
-            logger.warning("Configured tax app doesn't exists.")
-            return None
+            msg = "Configured tax app doesn't exist."
+            logger.warning(msg)
+            raise TaxDataError(msg)
         webhook = get_webhooks_for_event(event_type, apps_ids=[app.id]).first()
         if webhook is None:
-            logger.warning(
-                "Configured tax app's webhook for checkout taxes doesn't exists."
-            )
-            return None
+            msg = "Configured tax app's webhook for taxes calculation doesn't exists."
+            logger.warning(msg)
+            raise TaxDataError(msg)
 
         request_context = initialize_request(
             self.requestor,
@@ -3431,7 +3539,19 @@ class WebhookPlugin(BasePlugin):
             requestor=self.requestor,
             pregenerated_subscription_payload=pregenerated_subscription_payload,
         )
-        return parse_tax_data(response)
+        try:
+            tax_data = parse_tax_data(response, expected_lines_count)
+        except ValidationError as e:
+            errors = e.errors()
+            logger.warning(
+                "Webhook response for event %s is invalid: %s",
+                event_type,
+                str(e),
+                extra={"errors": errors},
+            )
+            error_msg = safe_truncate(parse_validation_error(e), TAX_ERROR_FIELD_LENGTH)
+            raise TaxDataError(error_msg, errors=errors) from e
+        return tax_data
 
     def get_taxes_for_checkout(
         self,
@@ -3440,10 +3560,11 @@ class WebhookPlugin(BasePlugin):
         app_identifier,
         previous_value,
         pregenerated_subscription_payloads: dict | None = None,
-    ) -> Optional["TaxData"]:
+    ) -> TaxData | None:
         if pregenerated_subscription_payloads is None:
             pregenerated_subscription_payloads = {}
         event_type = WebhookEventSyncType.CHECKOUT_CALCULATE_TAXES
+        lines_count = len(lines)
         if app_identifier:
             return self.__run_tax_webhook(
                 event_type,
@@ -3451,16 +3572,20 @@ class WebhookPlugin(BasePlugin):
                 lambda: generate_checkout_payload_for_tax_calculation(
                     checkout_info, lines
                 ),
+                lines_count,
                 checkout_info.checkout,
                 pregenerated_subscription_payloads=pregenerated_subscription_payloads,
             )
-        return trigger_all_webhooks_sync(
+        # This is deprecated flow, kept to maintain backward compatibility.
+        # In Saleor 4.0 `tax_app_identifier` should be required and the flow should
+        # be dropped.
+        return trigger_taxes_all_webhooks_sync(
             event_type,
             lambda: generate_checkout_payload_for_tax_calculation(
                 checkout_info,
                 lines,
             ),
-            parse_tax_data,
+            lines_count,
             checkout_info.checkout,
             self.requestor,
             pregenerated_subscription_payloads=pregenerated_subscription_payloads,
@@ -3468,25 +3593,33 @@ class WebhookPlugin(BasePlugin):
 
     def get_taxes_for_order(
         self, order: "Order", app_identifier, previous_value
-    ) -> Optional["TaxData"]:
+    ) -> TaxData | None:
         event_type = WebhookEventSyncType.ORDER_CALCULATE_TAXES
+        lines_count = order.lines.count()
         if app_identifier:
             return self.__run_tax_webhook(
                 event_type,
                 app_identifier,
                 lambda: generate_order_payload_for_tax_calculation(order),
+                lines_count,
                 order,
             )
-        return trigger_all_webhooks_sync(
+        # This is deprecated flow, kept to maintain backward compatibility.
+        # In Saleor 4.0 `tax_app_identifier` should be required and the flow should
+        # be dropped.
+        return trigger_taxes_all_webhooks_sync(
             WebhookEventSyncType.ORDER_CALCULATE_TAXES,
             lambda: generate_order_payload_for_tax_calculation(order),
-            parse_tax_data,
+            lines_count,
             order,
             self.requestor,
         )
 
     def get_shipping_methods_for_checkout(
-        self, checkout: "Checkout", previous_value: Any
+        self,
+        checkout: "Checkout",
+        built_in_shipping_methods: list["ShippingMethodData"],
+        previous_value: Any,
     ) -> list["ShippingMethodData"]:
         methods = []
         event_type = WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT
@@ -3501,7 +3634,7 @@ class WebhookPlugin(BasePlugin):
                     webhook=webhook,
                     cache_data=cache_data,
                     allow_replica=self.allow_replica,
-                    subscribable_object=checkout,
+                    subscribable_object=(checkout, built_in_shipping_methods),
                     request_timeout=WEBHOOK_SYNC_TIMEOUT,
                     cache_timeout=CACHE_TIME_SHIPPING_LIST_METHODS_FOR_CHECKOUT,
                     requestor=self.requestor,
@@ -3509,7 +3642,7 @@ class WebhookPlugin(BasePlugin):
 
                 if response_data:
                     shipping_methods = parse_list_shipping_methods_response(
-                        response_data, webhook.app
+                        response_data, webhook.app, checkout.currency
                     )
                     methods.extend(shipping_methods)
         return methods
@@ -3559,7 +3692,7 @@ class WebhookPlugin(BasePlugin):
             event_type=WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS,
             previous_value=previous_value,
             payload_fun=payload_fun,
-            subscribable_object=order,
+            subscribable_object=(order, available_shipping_methods),
             allow_replica=self.allow_replica,
             requestor=self.requestor,
         )
@@ -3582,7 +3715,7 @@ class WebhookPlugin(BasePlugin):
             event_type=WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS,
             previous_value=previous_value,
             payload_fun=payload_function,
-            subscribable_object=checkout,
+            subscribable_object=(checkout, available_shipping_methods),
             allow_replica=self.allow_replica,
             pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         )

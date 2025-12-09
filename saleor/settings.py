@@ -1,4 +1,5 @@
 import datetime
+import importlib.metadata
 import logging
 import os
 import os.path
@@ -10,8 +11,6 @@ import dj_database_url
 import dj_email_url
 import django_cache_url
 import django_stubs_ext
-import jaeger_client.config
-import pkg_resources
 import sentry_sdk
 import sentry_sdk.utils
 from celery.schedules import crontab
@@ -25,17 +24,30 @@ from pytimeparse import parse
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.django import DjangoIntegration
 from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.scrubber import DEFAULT_DENYLIST, DEFAULT_PII_DENYLIST, EventScrubber
 
 from . import PatchedSubscriberExecutionContext, __version__
+from .account.i18n_rules_override import i18n_rules_override
+from .core.db.patch import patch_db
 from .core.languages import LANGUAGES as CORE_LANGUAGES
-from .core.schedules import initiated_promotion_webhook_schedule
-from .graphql.executor import patch_executor
+from .core.rlimit import validate_and_set_rlimit
+from .core.schedules import (
+    initiated_checkout_automatic_completion_schedule,
+    initiated_promotion_webhook_schedule,
+)
+from .graphql.graphql_core import (
+    patch_execution_context,
+    patch_execution_result,
+    patch_executor,
+)
+from .graphql.promise import patch_promise
+from .patch_local import patch_local
 
 django_stubs_ext.monkeypatch()
 
 
 def get_list(text):
-    return [item.strip() for item in text.split(",")]
+    return [item.strip() for item in text.split(",") if item]
 
 
 def get_bool_from_env(name, default_value):
@@ -57,6 +69,13 @@ def get_url_from_env(name, *, schemes=None) -> str | None:
         return value
     return None
 
+
+# Possibility to set memory limits for the process. Function `validate_and_set_rlimit` set the
+# maximum size of the process's heap(`resource.RLIMIT_DATA`). If you set the memory limit and process will try to
+# allocate more memory than the limit, it will raise `MemoryError`.
+SOFT_MEMORY_LIMIT_IN_MB = os.environ.get("SOFT_MEMORY_LIMIT_IN_MB", None)
+HARD_MEMORY_LIMIT_IN_MB = os.environ.get("HARD_MEMORY_LIMIT_IN_MB", None)
+validate_and_set_rlimit(SOFT_MEMORY_LIMIT_IN_MB, HARD_MEMORY_LIMIT_IN_MB)
 
 DEBUG = get_bool_from_env("DEBUG", True)
 
@@ -101,12 +120,21 @@ DATABASE_CONNECTION_DEFAULT_NAME = "default"
 # This variable should be set to `replica`
 DATABASE_CONNECTION_REPLICA_NAME = "replica"
 
+if "DATABASE_URL_REPLICA" in os.environ:
+    DATABASE_URL_REPLICA_ENV_NAME = "DATABASE_URL_REPLICA"
+else:
+    # If replica env is not set, then always try to use the
+    # default env first.
+    DATABASE_URL_REPLICA_ENV_NAME = dj_database_url.DEFAULT_ENV
+
 DATABASES = {
     DATABASE_CONNECTION_DEFAULT_NAME: dj_database_url.config(
+        env=dj_database_url.DEFAULT_ENV,
         default="postgres://saleor:saleor@localhost:5432/saleor",
         conn_max_age=DB_CONN_MAX_AGE,
     ),
     DATABASE_CONNECTION_REPLICA_NAME: dj_database_url.config(
+        env=DATABASE_URL_REPLICA_ENV_NAME,
         default="postgres://saleor:saleor@localhost:5432/saleor",
         # TODO: We need to add read only user to saleor platform,
         # and we need to update docs.
@@ -298,7 +326,6 @@ INSTALLED_APPS = [
     "saleor.schedulers",
     # External apps
     "django_measurement",
-    "django_prices",
     "mptt",
     "django_countries",
     "django_filters",
@@ -338,6 +365,7 @@ LOGGING = {
             "datefmt": "%Y-%m-%dT%H:%M:%SZ",
             "format": (
                 "%(asctime)s %(levelname)s %(celeryTaskId)s %(celeryTaskName)s "
+                "%(message)s "
             ),
         },
         "celery_task_json": {
@@ -351,6 +379,15 @@ LOGGING = {
         "verbose": {
             "format": (
                 "%(asctime)s %(levelname)s %(name)s %(message)s "
+                "[PID:%(process)d:%(threadName)s]"
+            )
+        },
+        "verbose_breaker": {
+            "format": (
+                "%(asctime)s %(levelname)s %(name)s %(message)s "
+                "App name: %(app_name)s, total webhooks %(webhooks_total_count)s, "
+                "errors count %(webhooks_errors_count)s, "
+                "Cooldown is %(webhooks_cooldown_seconds)s seconds. "
                 "[PID:%(process)d:%(threadName)s]"
             )
         },
@@ -376,11 +413,21 @@ LOGGING = {
             "class": "logging.StreamHandler",
             "formatter": "verbose" if DEBUG else "celery_task_json",
         },
+        "breaker_board": {
+            "level": "INFO",
+            "class": "logging.StreamHandler",
+            "formatter": "verbose_breaker" if DEBUG else "json",
+        },
         "null": {
             "class": "logging.NullHandler",
         },
     },
     "loggers": {
+        "django.request": {
+            "handlers": ["default"],
+            "level": "ERROR",
+            "propagate": False,
+        },
         "django": {"level": "INFO", "propagate": True},
         "django.server": {
             "handlers": ["django.server"],
@@ -388,6 +435,11 @@ LOGGING = {
             "propagate": False,
         },
         "celery.app.trace": {
+            "handlers": ["celery_app"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "celery.worker": {
             "handlers": ["celery_app"],
             "level": "INFO",
             "propagate": False,
@@ -403,10 +455,16 @@ LOGGING = {
             "level": "INFO",
             "propagate": False,
         },
+        "breaker_board": {
+            "handlers": ["breaker_board"],
+            "level": "INFO",
+            "propagate": False,
+        },
         "graphql.execution.utils": {"propagate": False, "handlers": ["null"]},
         "graphql.execution.executor": {"propagate": False, "handlers": ["null"]},
     },
 }
+
 
 AUTH_USER_MODEL = "account.User"
 
@@ -419,7 +477,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 DEFAULT_COUNTRY: str = os.environ.get("DEFAULT_COUNTRY", "US")
 DEFAULT_DECIMAL_PLACES = 3
-DEFAULT_MAX_DIGITS = 12
+DEFAULT_MAX_DIGITS = 20
 DEFAULT_CURRENCY_CODE_LENGTH = 3
 
 # The default max length for the display name of the
@@ -427,7 +485,16 @@ DEFAULT_CURRENCY_CODE_LENGTH = 3
 # Following the recommendation of https://tools.ietf.org/html/rfc5322#section-2.1.1
 DEFAULT_MAX_EMAIL_DISPLAY_NAME_LENGTH = 78
 
-COUNTRIES_OVERRIDE = {"EU": "European Union"}
+COUNTRIES_OVERRIDE = {
+    "EU": "European Union",
+    "XK": {
+        "name": "Kosovo",
+        "alpha3": "XXK",
+        "ioc_code": "KOS",
+        "numeric": "383",
+        "numeric_padded": "0383",
+    },
+}
 
 MAX_USER_ADDRESSES = int(os.environ.get("MAX_USER_ADDRESSES", 100))
 
@@ -455,7 +522,7 @@ AWS_QUERYSTRING_EXPIRE = get_bool_from_env("AWS_QUERYSTRING_EXPIRE", 3600)
 AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_STATIC_CUSTOM_DOMAIN")
 AWS_S3_ENDPOINT_URL = os.environ.get("AWS_S3_ENDPOINT_URL", None)
 AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME", None)
-AWS_S3_URL_PROTOCOL = os.environ.get("AWS_S3_URL_PROTOCOL")
+AWS_S3_URL_PROTOCOL = os.environ.get("AWS_S3_URL_PROTOCOL", "https:")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME")
 AWS_DEFAULT_ACL = os.environ.get("AWS_DEFAULT_ACL", None)
@@ -465,11 +532,10 @@ AWS_S3_FILE_OVERWRITE = get_bool_from_env("AWS_S3_FILE_OVERWRITE", True)
 # See https://django-storages.readthedocs.io/en/latest/backends/gcloud.html
 GS_PROJECT_ID = os.environ.get("GS_PROJECT_ID")
 GS_BUCKET_NAME = os.environ.get("GS_BUCKET_NAME")
-GS_BUCKET_NAME = os.environ.get("GS_BUCKET_NAME")
 GS_LOCATION = os.environ.get("GS_LOCATION", "")
 GS_CUSTOM_ENDPOINT = os.environ.get("GS_CUSTOM_ENDPOINT")
 GS_MEDIA_BUCKET_NAME = os.environ.get("GS_MEDIA_BUCKET_NAME")
-GS_MEDIA_PRIVATE_BUCKET_NAME = os.environ.get("GS_MEDIA_BUCKET_NAME")
+GS_MEDIA_PRIVATE_BUCKET_NAME = os.environ.get("GS_MEDIA_PRIVATE_BUCKET_NAME")
 GS_AUTO_CREATE_BUCKET = get_bool_from_env("GS_AUTO_CREATE_BUCKET", False)
 GS_QUERYSTRING_AUTH = get_bool_from_env("GS_QUERYSTRING_AUTH", False)
 GS_DEFAULT_ACL = os.environ.get("GS_DEFAULT_ACL", None)
@@ -492,17 +558,23 @@ AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER")
 AZURE_CONTAINER_PRIVATE = os.environ.get("AZURE_CONTAINER_PRIVATE")
 AZURE_SSL = os.environ.get("AZURE_SSL")
 
+# Replicate behavior of creating default values
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+}
+
 if AWS_STORAGE_BUCKET_NAME:
-    STATICFILES_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
+    STORAGES["staticfiles"] = {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
 elif GS_BUCKET_NAME:
-    STATICFILES_STORAGE = "storages.backends.gcloud.GoogleCloudStorage"
+    STORAGES["staticfiles"] = {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage"}
 
 if AWS_MEDIA_BUCKET_NAME:
-    DEFAULT_FILE_STORAGE = "saleor.core.storages.S3MediaStorage"
+    STORAGES["default"] = {"BACKEND": "saleor.core.storages.S3MediaStorage"}
 elif GS_MEDIA_BUCKET_NAME:
-    DEFAULT_FILE_STORAGE = "saleor.core.storages.GCSMediaStorage"
+    STORAGES["default"] = {"BACKEND": "saleor.core.storages.GCSMediaStorage"}
 elif AZURE_CONTAINER:
-    DEFAULT_FILE_STORAGE = "saleor.core.storages.AzureMediaStorage"
+    STORAGES["default"] = {"BACKEND": "saleor.core.storages.AzureMediaStorage"}
 
 PRIVATE_FILE_STORAGE = "django.core.files.storage.FileSystemStorage"
 if AWS_MEDIA_PRIVATE_BUCKET_NAME:
@@ -550,6 +622,12 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_BROKER_URL = (
     os.environ.get("CELERY_BROKER_URL", os.environ.get("CLOUDAMQP_URL")) or ""
 )
+
+# Mitigation of https://github.com/celery/kombu/issues/2400
+# Allows passing MessageGroupId for non-FIFO queues
+if CELERY_BROKER_URL.startswith("sqs://"):
+    CELERY_BROKER_TRANSPORT = "saleor.core.sqs.Transport"
+
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", None)
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_ALWAYS_EAGER = not CELERY_BROKER_URL
@@ -633,6 +711,11 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": datetime.timedelta(seconds=BEAT_UPDATE_SEARCH_SEC),
         "options": {"expires": BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC},
     },
+    "update-pages-search-vectors": {
+        "task": "saleor.page.tasks.update_pages_search_vector_task",
+        "schedule": datetime.timedelta(seconds=BEAT_UPDATE_SEARCH_SEC),
+        "options": {"expires": BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC},
+    },
     "expire-orders": {
         "task": "saleor.order.tasks.expire_orders_task",
         "schedule": BEAT_EXPIRE_ORDERS_AFTER_TIMEDELTA,
@@ -657,6 +740,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "saleor.product.tasks.recalculate_discounted_price_for_products_task",
         "schedule": datetime.timedelta(seconds=BEAT_PRICE_RECALCULATION_SCHEDULE),
         "options": {"expires": BEAT_PRICE_RECALCULATION_SCHEDULE_EXPIRE_AFTER_SEC},
+    },
+    "checkout-automatic-completion": {
+        # Scheduled task that runs every 60 seconds to check for checkout
+        # readiness for automatic completion.
+        "task": "saleor.checkout.tasks.trigger_automatic_checkout_completion_task",
+        "schedule": initiated_checkout_automatic_completion_schedule,
     },
 }
 
@@ -745,7 +834,28 @@ def SENTRY_INIT(dsn: str, sentry_opts: dict):
     Will only be called if SENTRY_DSN is not None, during core start, can be
     overriden in separate settings file.
     """
-    sentry_sdk.init(dsn, release=__version__, **sentry_opts)
+
+    SALEOR_DENYLIST = DEFAULT_DENYLIST + ["private_metadata"]
+    SALEOR_PII_DENYLIST = DEFAULT_PII_DENYLIST + [
+        "first_name",
+        "last_name",
+        "email",
+        "company_name",
+        "street_address",
+        "street_address_1",
+        "street_address_2",
+        "user_email",
+    ]
+
+    sentry_sdk.init(
+        dsn,
+        release=__version__,
+        send_default_pii=False,
+        event_scrubber=EventScrubber(
+            denylist=SALEOR_DENYLIST, pii_denylist=SALEOR_PII_DENYLIST
+        ),
+        **sentry_opts,
+    )
     ignore_logger("graphql.execution.utils")
     ignore_logger("graphql.execution.executor")
 
@@ -765,34 +875,33 @@ GRAPHQL_QUERY_MAX_COMPLEXITY = int(
 FEDERATED_QUERY_MAX_ENTITIES = int(os.environ.get("FEDERATED_QUERY_MAX_ENTITIES", 100))
 
 BUILTIN_PLUGINS = [
-    "saleor.plugins.avatax.plugin.AvataxPlugin",
+    "saleor.plugins.avatax.plugin.DeprecatedAvataxPlugin",
     "saleor.plugins.webhook.plugin.WebhookPlugin",
-    "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
-    "saleor.payment.gateways.dummy_credit_card.plugin.DummyCreditCardGatewayPlugin",
-    "saleor.payment.gateways.stripe.deprecated.plugin.DeprecatedStripeGatewayPlugin",
+    "saleor.payment.gateways.dummy.plugin.DeprecatedDummyGatewayPlugin",
+    "saleor.payment.gateways.dummy_credit_card.plugin.DeprecatedDummyCreditCardGatewayPlugin",
     "saleor.payment.gateways.stripe.plugin.StripeGatewayPlugin",
-    "saleor.payment.gateways.braintree.plugin.BraintreeGatewayPlugin",
-    "saleor.payment.gateways.razorpay.plugin.RazorpayGatewayPlugin",
+    "saleor.payment.gateways.braintree.plugin.DeprecatedBraintreeGatewayPlugin",
+    "saleor.payment.gateways.razorpay.plugin.DeprecatedRazorpayGatewayPlugin",
     "saleor.payment.gateways.adyen.plugin.AdyenGatewayPlugin",
     "saleor.payment.gateways.authorize_net.plugin.AuthorizeNetGatewayPlugin",
     "saleor.payment.gateways.np_atobarai.plugin.NPAtobaraiGatewayPlugin",
     "saleor.plugins.user_email.plugin.UserEmailPlugin",
     "saleor.plugins.admin_email.plugin.AdminEmailPlugin",
-    "saleor.plugins.sendgrid.plugin.SendgridEmailPlugin",
+    "saleor.plugins.sendgrid.plugin.DeprecatedSendgridEmailPlugin",
     "saleor.plugins.openid_connect.plugin.OpenIDConnectPlugin",
 ]
 
 # Plugin discovery
 EXTERNAL_PLUGINS = []
-installed_plugins = pkg_resources.iter_entry_points("saleor.plugins")
+installed_plugins = importlib.metadata.entry_points(group="saleor.plugins")
 for entry_point in installed_plugins:
-    plugin_path = f"{entry_point.module_name}.{entry_point.attrs[0]}"
+    plugin_path = f"{entry_point.module}.{entry_point.attr}"
     if plugin_path not in BUILTIN_PLUGINS and plugin_path not in EXTERNAL_PLUGINS:
         if entry_point.name not in INSTALLED_APPS:
             INSTALLED_APPS.append(entry_point.name)
         EXTERNAL_PLUGINS.append(plugin_path)
 
-PLUGINS = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
+PLUGINS: list[str] = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
 
 # When `True`, HTTP requests made from arbitrary URLs will be rejected (e.g., webhooks).
 # if they try to access private IP address ranges, and loopback ranges (unless
@@ -810,35 +919,14 @@ HTTP_IP_FILTER_ALLOW_LOOPBACK_IPS: bool = get_bool_from_env(
 # time of the reservation in seconds.
 RESERVE_DURATION = 45
 
-# Initialize a simple and basic Jaeger Tracing integration
-# for open-tracing if enabled.
-#
-# Refer to our guide on https://docs.saleor.io/docs/next/guides/opentracing-jaeger/.
-#
-# If running locally, set:
-#   JAEGER_AGENT_HOST=localhost
-JAEGER_HOST = os.environ.get("JAEGER_AGENT_HOST")
-if JAEGER_HOST:
-    jaeger_client.Config(
-        config={
-            "sampler": {"type": "const", "param": 1},
-            "local_agent": {
-                "reporting_port": os.environ.get(
-                    "JAEGER_AGENT_PORT", jaeger_client.config.DEFAULT_REPORTING_PORT
-                ),
-                "reporting_host": JAEGER_HOST,
-            },
-            "logging": get_bool_from_env("JAEGER_LOGGING", False),
-        },
-        service_name="saleor",
-        validate=True,
-    ).initialize_tracer()
-
 
 # Some cloud providers (Heroku) export REDIS_URL variable instead of CACHE_URL
 REDIS_URL = os.environ.get("REDIS_URL")
-if REDIS_URL:
-    CACHE_URL = os.environ.setdefault("CACHE_URL", REDIS_URL)
+CACHE_URL = (
+    os.environ.setdefault("CACHE_URL", REDIS_URL)
+    if REDIS_URL
+    else os.environ.get("CACHE_URL")
+)
 CACHES = {"default": django_cache_url.config()}
 CACHES["default"]["TIMEOUT"] = parse(os.environ.get("CACHE_TIMEOUT", "7 days"))
 
@@ -861,15 +949,22 @@ JWT_TTL_REQUEST_EMAIL_CHANGE = datetime.timedelta(
 CHECKOUT_PRICES_TTL = datetime.timedelta(
     seconds=parse(os.environ.get("CHECKOUT_PRICES_TTL", "1 hour"))
 )
+CHECKOUT_DELIVERY_OPTIONS_TTL = datetime.timedelta(
+    seconds=parse(os.environ.get("CHECKOUT_DELIVERY_OPTIONS_TTL", "24 hours"))
+)
 
 CHECKOUT_TTL_BEFORE_RELEASING_FUNDS = datetime.timedelta(
     seconds=parse(os.environ.get("CHECKOUT_TTL_BEFORE_RELEASING_FUNDS", "6 hours"))
 )
-CHECKOUT_BATCH_FOR_RELEASING_FUNDS = os.environ.get(
-    "CHECKOUT_BATCH_FOR_RELEASING_FUNDS", 30
-)
 TRANSACTION_BATCH_FOR_RELEASING_FUNDS = os.environ.get(
     "TRANSACTION_BATCH_FOR_RELEASING_FUNDS", 60
+)
+# Oldest checkout modification for automatic completion. Older checkouts will not be
+# processed.
+AUTOMATIC_CHECKOUT_COMPLETION_OLDEST_MODIFIED = datetime.timedelta(
+    seconds=parse(
+        os.environ.get("AUTOMATIC_CHECKOUT_COMPLETION_OLDEST_MODIFIED", "30 days")
+    )
 )
 
 
@@ -882,12 +977,17 @@ SEARCH_ORDERS_MAX_INDEXED_TRANSACTIONS = 20
 SEARCH_ORDERS_MAX_INDEXED_PAYMENTS = 20
 SEARCH_ORDERS_MAX_INDEXED_DISCOUNTS = 20
 SEARCH_ORDERS_MAX_INDEXED_LINES = 100
+SEARCH_ORDERS_MAX_INDEXED_INVOICES = 20
+SEARCH_ORDERS_MAX_INDEXED_EVENTS = 50
 
 # Maximum related objects that can be indexed in a product
 PRODUCT_MAX_INDEXED_ATTRIBUTES = 1000
 PRODUCT_MAX_INDEXED_ATTRIBUTE_VALUES = 100
 PRODUCT_MAX_INDEXED_VARIANTS = 1000
 
+# Maximum related objects that can be indexed in a page
+PAGE_MAX_INDEXED_ATTRIBUTES = 1000
+PAGE_MAX_INDEXED_ATTRIBUTE_VALUES = 100
 
 # Patch SubscriberExecutionContext class from `graphql-core-legacy` package
 # to fix bug causing not returning errors for subscription queries.
@@ -974,6 +1074,11 @@ ORDER_RULES_LIMIT = os.environ.get("ORDER_RULES_LIMIT", 100)
 # The max number of gits assigned to promotion rule
 GIFTS_LIMIT_PER_RULE = os.environ.get("GIFTS_LIMIT_PER_RULE", 500)
 
+# Default automatic completion delay for checkout in minutes.
+DEFAULT_AUTOMATIC_CHECKOUT_COMPLETION_DELAY = int(
+    os.environ.get("AUTOMATIC_CHECKOUT_COMPLETION_DELAY", 30)
+)
+
 # Whether to enable the comparison of pre-save and post-save webhook payloads in
 # mutations, in order to limit sending webhooks where the payload has not changed as
 # a result of the mutation. Note: this works only for subscriptions webhooks; legacy
@@ -988,6 +1093,68 @@ ENABLE_LIMITING_WEBHOOKS_FOR_IDENTICAL_PAYLOADS = get_bool_from_env(
 TRANSACTION_ITEMS_LIMIT = 100
 
 
+TOKEN_GENERATOR_CLASS = "django.contrib.auth.tokens.PasswordResetTokenGenerator"
+
 # Disable Django warnings regarding too long cache keys being incompatible with
 # memcached to avoid leaking key values.
 warnings.filterwarnings("ignore", category=CacheKeyWarning)
+
+
+# Breaker board configuration
+BREAKER_BOARD_ENABLED = get_bool_from_env("BREAKER_BOARD_ENABLED", False)
+# Storage class string for the breaker board, for example:
+# "saleor.webhook.circuit_breaker.storage.RedisStorage"
+BREAKER_BOARD_STORAGE_CLASS = "saleor.webhook.circuit_breaker.storage.RedisStorage"
+if BREAKER_BOARD_ENABLED and (CACHE_URL is None or not CACHE_URL.startswith("redis")):
+    raise ImproperlyConfigured(
+        "Redis storage cannot be used when Redis cache is not configured."
+    )
+# List of lowercase sync webhook events that should be monitored by the breaker board, for ex:
+# "checkout_calculate_taxes, shipping_list_methods_for_checkout".
+BREAKER_BOARD_SYNC_EVENTS = get_list(os.environ.get("BREAKER_BOARD_SYNC_EVENTS", ""))
+
+# Subset of BREAKER_BOARD_SYNC_EVENTS that should be monitored by the breaker board,
+# but should not be disabled in case of exceeding failure thresholds
+BREAKER_BOARD_DRY_RUN_SYNC_EVENTS = get_list(
+    os.environ.get("BREAKER_BOARD_DRY_RUN_SYNC_EVENTS", "")
+)
+
+TELEMETRY_TRACER_CLASS = "saleor.core.telemetry.trace.Tracer"
+TELEMETRY_METER_CLASS = "saleor.core.telemetry.metric.Meter"
+# Whether to raise or log exceptions for telemetry unit conversion errors
+# Disabled by default to prevent disruptions caused by unexpected unit conversion issues
+TELEMETRY_RAISE_UNIT_CONVERSION_ERRORS = False
+# The default threshold for slow operations is set to 1 second, based on production monitoring data.
+# Only a small percentage of queries are expected to exceed this threshold.
+TELEMETRY_SLOW_GRAPHQL_OPERATION_THRESHOLD = float(
+    os.environ.get("TELEMETRY_SLOW_GRAPHQL_OPERATION_THRESHOLD", 1.0)
+)
+
+# Additional hash suffix, allowing to invalidate cached schema. In production usually we want this to be empty.
+# For development envs, where schema may change often, it may be convenient to set it to e.g. commit hash value.
+GRAPHQL_CACHE_SUFFIX = os.environ.get("GRAPHQL_CACHE_SUFFIX", "")
+
+# Library `google-i18n-address` use `AddressValidationMetadata` form Google to provide address validation rules.
+# Patch `i18n` module to allows to override the default address rules.
+i18n_rules_override()
+
+# Patch Promise to remove all references that could result in reference cycles, allowing memory to be freed
+# immediately, without the need of a deep garbage collection cycle.
+patch_promise()
+
+# Patch `DatabaseClient`, `DatabaseCreation`, `DatabaseFeatures`, `DatabaseIntrospection`, `DatabaseOperations`,
+# `BaseDatabaseValidation` and `DatabaseErrorWrapper` to remove all references that could result in reference cycles,
+# allowing memory to be freed immediately, without the need of a deep garbage collection cycle.
+patch_db()
+
+# Patch `Local` to remove all references that could result in reference cycles,
+# allowing memory to be freed immediately, without the need of a deep garbage collection cycle.
+patch_local()
+
+# Patch `ExecutionContext` to remove all references that could result in reference cycles,
+# allowing memory to be freed immediately, without the need of a deep garbage collection cycle.
+patch_execution_context()
+
+# Patch `ExecutionResult` to remove all references that could result in reference cycles,
+# allowing memory to be freed immediately, without the need of a deep garbage collection cycle.
+patch_execution_result()

@@ -14,7 +14,6 @@ from ....checkout.fetch import (
 from ....checkout.utils import (
     change_shipping_address_in_checkout,
     invalidate_checkout,
-    is_shipping_required,
 )
 from ....core.tracing import traced_atomic_transaction
 from ....graphql.account.mixins import AddressMetadataMixin
@@ -22,7 +21,8 @@ from ....warehouse.reservations import is_reservation_enabled
 from ....webhook.event_types import WebhookEventAsyncType
 from ...account.i18n import I18nMixin
 from ...account.types import AddressInput
-from ...core.descriptions import DEPRECATED_IN_3X_INPUT
+from ...core.context import SyncWebhookControlContext
+from ...core.descriptions import ADDED_IN_321, DEPRECATED_IN_3X_INPUT
 from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.mutations import BaseMutation
 from ...core.scalars import UUID
@@ -34,10 +34,9 @@ from ..types import Checkout
 from .checkout_create import CheckoutAddressValidationRules
 from .utils import (
     ERROR_CC_ADDRESS_CHANGE_FORBIDDEN,
-    ERROR_DOES_NOT_SHIP,
     check_lines_quantity,
     get_checkout,
-    update_checkout_shipping_method_if_invalid,
+    mark_checkout_deliveries_as_stale_if_needed,
 )
 
 if TYPE_CHECKING:
@@ -66,6 +65,16 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             required=True,
             description="The mailing address to where the checkout will be shipped.",
         )
+        save_address = graphene.Boolean(
+            required=False,
+            default_value=True,
+            description=(
+                "Indicates whether the shipping address should be saved "
+                "to the user’s address book upon checkout completion. "
+                "If not provided, the default behavior is to save the address."
+            )
+            + ADDED_IN_321,
+        )
         validation_rules = CheckoutAddressValidationRules(
             required=False,
             description=(
@@ -74,7 +83,7 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
         )
 
     class Meta:
-        description = "Update shipping address in the existing checkout."
+        description = "Updates shipping address in the existing checkout."
         doc_category = DOC_CATEGORY_CHECKOUT
         error_type_class = CheckoutError
         error_type_field = "checkout_errors"
@@ -115,12 +124,13 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
         )
 
     @classmethod
-    def perform_mutation(
+    def perform_mutation(  # type: ignore[override]
         cls,
         _root,
         info,
         /,
         shipping_address,
+        save_address,
         validation_rules=None,
         checkout_id=None,
         token=None,
@@ -144,15 +154,6 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             checkout,
         )
 
-        if use_legacy_error_flow_for_checkout and not is_shipping_required(lines):
-            raise ValidationError(
-                {
-                    "shipping_address": ValidationError(
-                        ERROR_DOES_NOT_SHIP,
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED.value,
-                    )
-                }
-            )
         # prevent from changing the shipping address when click and collect is used.
         if checkout.collection_point_id:
             raise ValidationError(
@@ -176,10 +177,7 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             ),
         )
         manager = get_plugin_manager_promise(info.context).get()
-        shipping_channel_listings = checkout.channel.shipping_method_listings.all()
-        checkout_info = fetch_checkout_info(
-            checkout, lines, manager, shipping_channel_listings
-        )
+        checkout_info = fetch_checkout_info(checkout, lines, manager)
 
         country = shipping_address_instance.country.code
         checkout.set_country(country, commit=True)
@@ -191,10 +189,8 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
                 lines,
                 country,
                 checkout_info.channel.slug,
-                checkout_info.delivery_method_info,
+                checkout_info.get_delivery_method_info(),
             )
-
-        update_checkout_shipping_method_if_invalid(checkout_info, lines)
 
         shipping_address_updated_fields = []
         with traced_atomic_transaction():
@@ -202,16 +198,20 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             shipping_address_updated_fields = change_shipping_address_in_checkout(
                 checkout_info,
                 shipping_address_instance,
-                lines,
-                manager,
-                shipping_channel_listings,
+                save_address,
             )
+
+        shipping_update_fields = mark_checkout_deliveries_as_stale_if_needed(
+            checkout_info.checkout, lines
+        )
+
         invalidate_prices_updated_fields = invalidate_checkout(
             checkout_info, lines, manager, save=False
         )
         checkout.save(
             update_fields=shipping_address_updated_fields
             + invalidate_prices_updated_fields
+            + shipping_update_fields
         )
 
         call_checkout_info_event(
@@ -221,4 +221,6 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             lines=lines,
         )
 
-        return CheckoutShippingAddressUpdate(checkout=checkout)
+        return CheckoutShippingAddressUpdate(
+            checkout=SyncWebhookControlContext(node=checkout)
+        )

@@ -2,9 +2,11 @@ import graphene
 from django.db import transaction
 
 from ....order import OrderEvents, error_codes, events, models
+from ....order.search import update_order_search_vector
 from ....permission.enums import OrderPermissions
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_ORDERS
 from ...core.types import Error
 from ...plugins.dataloaders import get_plugin_manager_promise
@@ -63,4 +65,8 @@ class OrderNoteUpdate(OrderNoteCommon):
                 related_event=order_event_to_update,
             )
             call_event_by_order_status(order, manager)
-        return OrderNoteUpdate(order=order, event=event)
+            update_order_search_vector(order)
+        return OrderNoteUpdate(
+            order=SyncWebhookControlContext(order),
+            event=SyncWebhookControlContext(event),
+        )

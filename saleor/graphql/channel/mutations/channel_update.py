@@ -22,7 +22,7 @@ from ....webhook.event_types import WebhookEventAsyncType
 from ...account.enums import CountryCodeEnum
 from ...core import ResolveInfo
 from ...core.doc_category import DOC_CATEGORY_CHANNELS
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import ChannelError, NonNullList
 from ...core.utils import WebhookEventInfo
 from ...plugins.dataloaders import get_plugin_manager_promise
@@ -62,7 +62,7 @@ class ChannelUpdateInput(ChannelInput):
         doc_category = DOC_CATEGORY_CHANNELS
 
 
-class ChannelUpdate(ModelMutation):
+class ChannelUpdate(DeprecatedModelMutation):
     class Arguments:
         id = graphene.ID(required=True, description="ID of a channel to update.")
         input = ChannelUpdateInput(
@@ -131,7 +131,7 @@ class ChannelUpdate(ModelMutation):
             clean_input_order_settings(order_settings, cleaned_input, instance)
 
         if checkout_settings := cleaned_input.get("checkout_settings"):
-            clean_input_checkout_settings(checkout_settings, cleaned_input)
+            clean_input_checkout_settings(checkout_settings, cleaned_input, instance)
 
         if payment_settings := cleaned_input.get("payment_settings"):
             clean_input_payment_settings(payment_settings, cleaned_input)
@@ -139,7 +139,7 @@ class ChannelUpdate(ModelMutation):
         return cleaned_input
 
     @classmethod
-    def check_permissions(cls, context, permissions=None, **data):
+    def check_permissions(cls, context, permissions=None, **data):  # type: ignore[override]
         permissions = [ChannelPermissions.MANAGE_CHANNELS]
         has_permission = super().check_permissions(
             context, permissions, require_all_permissions=False, **data

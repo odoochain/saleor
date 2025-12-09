@@ -1,3 +1,5 @@
+from typing import Final
+
 import graphene
 from django.core.exceptions import ValidationError
 
@@ -10,12 +12,13 @@ from ....order.models import Order
 from ....permission.enums import CheckoutPermissions
 from ....tax import error_codes
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_TAXES
 from ...core.types import Error
 from ...core.types.taxes import TaxSourceObject
 from ...plugins.dataloaders import get_plugin_manager_promise
 
-TaxExemptionManageErrorCode = graphene.Enum.from_enum(
+TaxExemptionManageErrorCode: Final[graphene.Enum] = graphene.Enum.from_enum(
     error_codes.TaxExemptionManageErrorCode
 )
 TaxExemptionManageErrorCode.doc_category = DOC_CATEGORY_TAXES
@@ -94,7 +97,14 @@ class TaxExemptionManage(BaseMutation):
 
         if isinstance(obj, Checkout):
             cls._invalidate_checkout(info, obj)
-            obj.save(update_fields=["tax_exemption", "price_expiration", "last_change"])
+            obj.save(
+                update_fields=[
+                    "tax_exemption",
+                    "price_expiration",
+                    "discount_expiration",
+                    "last_change",
+                ]
+            )
 
         if isinstance(obj, Order):
             cls.validate_order_status(obj)
@@ -103,4 +113,4 @@ class TaxExemptionManage(BaseMutation):
                 update_fields=["tax_exemption", "should_refresh_prices", "updated_at"]
             )
 
-        return TaxExemptionManage(taxable_object=obj)
+        return TaxExemptionManage(taxable_object=SyncWebhookControlContext(node=obj))

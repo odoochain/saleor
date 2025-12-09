@@ -1,14 +1,14 @@
+from typing import Final
+
 import graphene
 from django.db import transaction
 
 from ....order import error_codes, events
+from ....order.search import update_order_search_vector
 from ....permission.enums import OrderPermissions
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
-from ...core.descriptions import (
-    DEPRECATED_IN_3X_INPUT,
-    DEPRECATED_IN_3X_MUTATION,
-)
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_ORDERS
 from ...core.types import BaseInputObjectType, Error, OrderError
 from ...plugins.dataloaders import get_plugin_manager_promise
@@ -16,7 +16,9 @@ from ..types import Order, OrderEvent
 from .order_note_common import OrderNoteCommon
 from .utils import call_event_by_order_status
 
-OrderNoteAddErrorCode = graphene.Enum.from_enum(error_codes.OrderNoteAddErrorCode)
+OrderNoteAddErrorCode: Final[graphene.Enum] = graphene.Enum.from_enum(
+    error_codes.OrderNoteAddErrorCode
+)
 OrderNoteAddErrorCode.doc_category = DOC_CATEGORY_ORDERS
 
 
@@ -61,12 +63,16 @@ class OrderNoteAdd(OrderNoteCommon):
                 message=cleaned_input["message"],
             )
             call_event_by_order_status(order, manager)
-        return OrderNoteAdd(order=order, event=event)
+            update_order_search_vector(order)
+        return OrderNoteAdd(
+            order=SyncWebhookControlContext(order),
+            event=SyncWebhookControlContext(event),
+        )
 
 
 class OrderAddNoteInput(BaseInputObjectType):
     message = graphene.String(
-        description="Note message." + DEPRECATED_IN_3X_INPUT,
+        description="Note message.",
         name="message",
         required=True,
     )
@@ -82,7 +88,7 @@ class OrderAddNote(OrderNoteAdd):
         )
 
     class Meta:
-        description = "Adds note to the order." + DEPRECATED_IN_3X_MUTATION
+        description = "Adds note to the order."
         doc_category = DOC_CATEGORY_ORDERS
         permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError

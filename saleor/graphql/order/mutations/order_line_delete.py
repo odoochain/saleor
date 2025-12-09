@@ -14,6 +14,7 @@ from ....order.utils import (
 from ....permission.enums import OrderPermissions
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_ORDERS
 from ...core.mutations import BaseMutation
 from ...core.types import OrderError
@@ -94,12 +95,22 @@ class OrderLineDelete(EditableOrderValidationMixin, BaseMutation):
             invalidate_order_prices(order)
             recalculate_order_weight(order)
             update_order_search_vector(order, save=False)
+            order.lines_count = order.lines.count()
             updated_fields.extend(
-                ["should_refresh_prices", "weight", "search_vector", "updated_at"]
+                [
+                    "should_refresh_prices",
+                    "weight",
+                    "search_vector",
+                    "updated_at",
+                    "lines_count",
+                ]
             )
             order.save(update_fields=updated_fields)
             call_event_by_order_status(order, manager)
-        return OrderLineDelete(order=order, order_line=line)
+        return OrderLineDelete(
+            order=SyncWebhookControlContext(order),
+            order_line=SyncWebhookControlContext(line),
+        )
 
     @classmethod
     def validate(cls, info, order, line):

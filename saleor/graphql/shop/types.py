@@ -18,7 +18,8 @@ from ..core import ResolveInfo
 from ..core.context import get_database_connection_name
 from ..core.descriptions import (
     ADDED_IN_319,
-    DEPRECATED_IN_3X_FIELD,
+    ADDED_IN_322,
+    DEFAULT_DEPRECATION_REASON,
     DEPRECATED_IN_3X_INPUT,
 )
 from ..core.doc_category import (
@@ -40,6 +41,7 @@ from ..core.types import (
 )
 from ..core.utils import str_to_enum
 from ..meta.types import ObjectWithMetadata
+from ..page.types import PageType
 from ..payment.types import PaymentGateway
 from ..plugins.dataloaders import plugin_manager_promise_callback
 from ..shipping.types import ShippingMethod
@@ -79,6 +81,21 @@ class OrderSettings(ModelObjectType[site_models.SiteSettings]):
         model = site_models.SiteSettings
 
 
+class RefundSettings(ModelObjectType[site_models.SiteSettings]):
+    reason_reference_type = graphene.Field(
+        PageType, description="Model type used for refund reasons."
+    )
+
+    class Meta:
+        description = "Refund related settings from site settings." + ADDED_IN_322
+        doc_category = DOC_CATEGORY_ORDERS
+        model = site_models.SiteSettings
+
+    @staticmethod
+    def resolve_reason_reference_type(root, info):
+        return root.refund_reason_reference_type
+
+
 class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
     expiry_type = GiftCardSettingsExpiryTypeEnum(
         description="The gift card expiry type settings.", required=True
@@ -92,9 +109,11 @@ class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
         doc_category = DOC_CATEGORY_GIFT_CARDS
         model = site_models.SiteSettings
 
+    @staticmethod
     def resolve_expiry_type(root, info):
         return root.gift_card_expiry_type
 
+    @staticmethod
     def resolve_expiry_period(root, info):
         if root.gift_card_expiry_period_type is None:
             return None
@@ -319,7 +338,7 @@ class Shop(graphene.ObjectType):
         LimitInfo,
         required=True,
         description="Resource limitations and current usage if any set for a shop",
-        deprecation_reason=(f"{DEPRECATED_IN_3X_FIELD}"),
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
         permissions=[AuthorizationFilters.AUTHENTICATED_STAFF_USER],
     )
     version = PermissionsField(
@@ -353,28 +372,19 @@ class Shop(graphene.ObjectType):
     # deprecated
     include_taxes_in_prices = graphene.Boolean(
         description="Include taxes in prices.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use "
-            "`Channel.taxConfiguration.pricesEnteredWithTax` to determine whether "
-            "prices are entered with tax."
-        ),
+        deprecation_reason="Use `Channel.taxConfiguration.pricesEnteredWithTax` to determine whether prices are entered with tax.",
         required=True,
     )
     display_gross_prices = graphene.Boolean(
         description="Display prices with tax in store.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `Channel.taxConfiguration` to determine "
-            "whether to display gross or net prices."
-        ),
+        deprecation_reason="Use `Channel.taxConfiguration` to determine whether to display gross or net prices.",
         required=True,
     )
     charge_taxes_on_shipping = graphene.Boolean(
         description="Charge taxes on shipping.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `ShippingMethodType.taxClass` to determine "
-            "whether taxes are calculated for shipping methods; if a tax class is set, "
-            "the taxes will be calculated, otherwise no tax rate will be applied."
-        ),
+        deprecation_reason="Use `ShippingMethodType.taxClass` to determine "
+        "whether taxes are calculated for shipping methods; if a tax class is set, "
+        "the taxes will be calculated, otherwise no tax rate will be applied.",
         required=True,
     )
 

@@ -2,8 +2,8 @@ import graphene
 from django.core.exceptions import ValidationError
 from graphql.error.base import GraphQLError
 
+from ....attribute import models as attribute_models
 from ....checkout import models as checkout_models
-from ....checkout.models import Checkout
 from ....core import models
 from ....core.db.connection import allow_writer
 from ....core.error_codes import MetadataErrorCode
@@ -12,13 +12,13 @@ from ....discount import models as discount_models
 from ....discount.models import Promotion
 from ....menu import models as menu_models
 from ....order import models as order_models
+from ....page import models as page_models
 from ....product import models as product_models
 from ....shipping import models as shipping_models
-from ...channel import ChannelContext
 from ...core import ResolveInfo
+from ...core.context import BaseContext, ChannelContext, SyncWebhookControlContext
 from ...core.mutations import BaseMutation
 from ...core.utils import from_global_id_or_error
-from ...payment.utils import metadata_contains_empty_key
 from ..extra_methods import TYPE_EXTRA_METHODS
 from ..permissions import AccountPermissions
 from ..types import ObjectWithMetadata
@@ -34,7 +34,7 @@ class BaseMetadataMutation(BaseMutation):
         abstract = True
 
     @classmethod
-    def __init_subclass_with_meta__(
+    def __init_subclass_with_meta__(  # type: ignore[override]
         cls,
         arguments=None,
         permission_map=None,
@@ -107,24 +107,15 @@ class BaseMetadataMutation(BaseMutation):
 
     @classmethod
     def validate_model_is_model_with_metadata(cls, model, object_id):
-        if not issubclass(model, models.ModelWithMetadata) and not model == Checkout:
+        if (
+            not issubclass(model, models.ModelWithMetadata)
+            and not model == checkout_models.Checkout
+        ):
             raise ValidationError(
                 {
                     "id": ValidationError(
                         f"Couldn't resolve to a item with meta: {object_id}",
                         code=MetadataErrorCode.NOT_FOUND.value,
-                    )
-                }
-            )
-
-    @classmethod
-    def validate_metadata_keys(cls, metadata_list: list[dict]):
-        if metadata_contains_empty_key(metadata_list):
-            raise ValidationError(
-                {
-                    "input": ValidationError(
-                        "Metadata key cannot be empty.",
-                        code=MetadataErrorCode.REQUIRED.value,
                     )
                 }
             )
@@ -162,7 +153,7 @@ class BaseMetadataMutation(BaseMutation):
         return graphene_type._meta.model
 
     @classmethod
-    def check_permissions(cls, context, permissions=None, **data):
+    def check_permissions(cls, context, permissions=None, **data):  # type: ignore[override]
         is_app = bool(getattr(context, "app", None))
         if is_app and permissions and AccountPermissions.MANAGE_STAFF in permissions:
             raise PermissionDenied(
@@ -206,7 +197,7 @@ class BaseMetadataMutation(BaseMutation):
             has_changed = False
 
             instance = result.item
-            if isinstance(instance, ChannelContext):
+            if isinstance(instance, BaseContext):
                 instance = instance.node
 
             if instance:
@@ -258,24 +249,40 @@ class BaseMetadataMutation(BaseMutation):
     def success_response(cls, instance):
         """Return a success response."""
         # Wrap the instance with ChannelContext for models that use it.
-        use_channel_context = any(
-            isinstance(instance, Model)
-            for Model in [
-                discount_models.Voucher,
-                menu_models.Menu,
-                menu_models.MenuItem,
-                product_models.Collection,
-                product_models.Product,
-                product_models.ProductVariant,
-                shipping_models.ShippingMethod,
-                shipping_models.ShippingZone,
-            ]
+        use_channel_context = isinstance(
+            instance,
+            discount_models.Voucher
+            | menu_models.Menu
+            | menu_models.MenuItem
+            | product_models.Collection
+            | product_models.Product
+            | product_models.ProductVariant
+            | shipping_models.ShippingMethod
+            | shipping_models.ShippingZone
+            | attribute_models.Attribute
+            | attribute_models.AttributeValue
+            | page_models.Page,
         )
+
+        use_channel_context = use_channel_context or (
+            # For old sales migrated into promotions
+            isinstance(instance, Promotion) and instance.old_sale_id
+        )
+
         if use_channel_context:
             instance = ChannelContext(node=instance, channel_slug=None)
 
-        # For old sales migrated into promotions
-        if isinstance(instance, Promotion) and instance.old_sale_id:
-            instance = ChannelContext(node=instance, channel_slug=None)
+        use_webhook_sync_control_context = isinstance(
+            instance,
+            checkout_models.Checkout
+            | checkout_models.CheckoutLine
+            | order_models.Order
+            | order_models.OrderLine
+            | order_models.Fulfillment
+            | order_models.FulfillmentLine,
+        )
+
+        if use_webhook_sync_control_context:
+            instance = SyncWebhookControlContext(node=instance)
 
         return cls(item=instance, errors=[])

@@ -1,3 +1,4 @@
+import datetime
 import json
 import uuid
 from dataclasses import asdict
@@ -27,8 +28,6 @@ def fetch_kwargs(checkout_with_items, plugins_manager):
         ),
         "manager": plugins_manager,
         "lines": lines,
-        "address": checkout_with_items.shipping_address
-        or checkout_with_items.billing_address,
     }
 
 
@@ -85,6 +84,7 @@ def test_generate_deferred_payload(
     # given
     checkout = checkout_with_item
     fetch_checkout_data(**fetch_kwargs)
+    deferred_request_time = datetime.datetime(2020, 10, 5, tzinfo=datetime.UTC)
 
     event_type = WebhookEventAsyncType.CHECKOUT_UPDATED
     _, _, _, checkout_updated_webhook = setup_checkout_webhooks(event_type)
@@ -93,7 +93,7 @@ def test_generate_deferred_payload(
         object_id=checkout.pk,
         requestor_model_name="account.user",
         requestor_object_id=staff_user.pk,
-        request_time=None,
+        request_time=deferred_request_time,
     )
     delivery = EventDelivery(
         event_type=event_type,
@@ -117,6 +117,7 @@ def test_generate_deferred_payload(
     data = json.loads(data)
 
     assert data["issuingPrincipal"]["email"] == staff_user.email
+    assert data["issuedAt"] == deferred_request_time.isoformat()
     assert (
         data["checkout"]["totalPrice"]["gross"]["amount"] == checkout.total_gross_amount
     )

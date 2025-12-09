@@ -6,9 +6,11 @@ import graphene
 import pytest
 
 from ....core.models import EventDelivery
+from ....graphql.core.utils import to_global_id_or_none
 from ....graphql.tests.utils import get_graphql_content
 from ....graphql.webhook.utils import get_subscription_query_hash
 from ....order import OrderStatus
+from ....shipping.models import ShippingMethod
 from ....webhook.const import CACHE_EXCLUDED_SHIPPING_TIME
 from ....webhook.event_types import WebhookEventSyncType
 from ....webhook.models import Webhook
@@ -16,58 +18,52 @@ from ....webhook.payloads import (
     generate_excluded_shipping_methods_for_checkout_payload,
     generate_excluded_shipping_methods_for_order_payload,
 )
+from ....webhook.response_schemas.shipping import logger as schema_logger
+from ....webhook.response_schemas.utils.annotations import logger as annotations_logger
 from ....webhook.transport.shipping import (
     get_excluded_shipping_methods_from_response,
     get_excluded_shipping_methods_or_fetch,
     parse_list_shipping_methods_response,
-    to_shipping_app_id,
 )
+from ....webhook.transport.shipping_helpers import to_shipping_app_id
 from ....webhook.transport.synchronous.transport import trigger_webhook_sync
 from ....webhook.transport.utils import generate_cache_key_for_webhook
 from ...base_plugin import ExcludedShippingMethod
 
 ORDER_QUERY_SHIPPING_METHOD = """
-    query OrdersQuery {
-        orders(first: 1) {
-            edges {
-                node {
-                    shippingMethods {
-                        id
-                        name
-                        active
-                        message
-                    }
-                    availableShippingMethods {
-                        id
-                        name
-                        active
-                        message
-                    }
-                }
-            }
-        }
+query OrderQuery($id: ID) {
+  order(id: $id) {
+    shippingMethods {
+      id
+      name
+      active
+      message
     }
+    availableShippingMethods {
+      id
+      name
+      active
+      message
+    }
+  }
+}
 """
 
 CHECKOUT_QUERY_SHIPPING_METHOD = """
-    query CheckoutsQuery {
-        checkouts(first: 1) {
-            edges {
-                node {
-                    shippingMethods {
-                        id
-                        name
-                        active
-                    }
-                    availableShippingMethods {
-                        id
-                        name
-                        active
-                    }
-                }
-            }
-        }
+query Checkout($id: ID){
+  checkout(id: $id) {
+    shippingMethods {
+      id
+      name
+      active
     }
+    availableShippingMethods {
+      id
+      name
+      active
+    }
+  }
+}
 """
 
 
@@ -128,7 +124,7 @@ def test_excluded_shipping_methods_for_order(
         payload,
         shipping_webhook,
         False,
-        subscribable_object=order_with_lines,
+        subscribable_object=(order_with_lines, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -220,7 +216,7 @@ def test_multiple_app_with_excluded_shipping_methods_for_order(
         payload,
         shipping_webhook,
         False,
-        subscribable_object=order_with_lines,
+        subscribable_object=(order_with_lines, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -231,7 +227,7 @@ def test_multiple_app_with_excluded_shipping_methods_for_order(
         payload,
         second_shipping_webhook,
         False,
-        subscribable_object=order_with_lines,
+        subscribable_object=(order_with_lines, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -352,7 +348,7 @@ def test_multiple_webhooks_on_the_same_app_with_excluded_shipping_methods_for_or
         payload,
         first_webhook,
         False,
-        subscribable_object=order_with_lines,
+        subscribable_object=(order_with_lines, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -363,7 +359,7 @@ def test_multiple_webhooks_on_the_same_app_with_excluded_shipping_methods_for_or
         payload,
         second_webhook,
         False,
-        subscribable_object=order_with_lines,
+        subscribable_object=(order_with_lines, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -401,7 +397,11 @@ def test_multiple_webhooks_on_the_same_app_with_excluded_shipping_methods_for_or
     )
 
 
-def test_parse_excluded_shipping_methods_response(app):
+@mock.patch.object(annotations_logger, "warning")
+@mock.patch.object(schema_logger, "warning")
+def test_parse_excluded_shipping_methods_response(
+    mocked_schema_logger, mocked_annotations_logger, app
+):
     # given
     external_id = to_shipping_app_id(app, "test-1234")
     response = {
@@ -423,14 +423,58 @@ def test_parse_excluded_shipping_methods_response(app):
             },
         ]
     }
+    webhook = Webhook.objects.create(
+        name="shipping-webhook-1",
+        app=app,
+        target_url="https://shipping-gateway.com/apiv2/",
+    )
 
     # when
-    excluded_methods = get_excluded_shipping_methods_from_response(response)
+    excluded_methods = get_excluded_shipping_methods_from_response(response, webhook)
 
     # then
     assert len(excluded_methods) == 2
-    assert excluded_methods[0]["id"] == "2"
-    assert excluded_methods[1]["id"] == external_id
+    assert excluded_methods[0].id == "2"
+    assert excluded_methods[1].id == external_id
+    # 2 warning for each invalid data
+    # warning for malformed id
+    assert mocked_schema_logger.call_count == 3
+    # warning for skipping shipping method
+    assert mocked_annotations_logger.call_count == 3
+
+
+@mock.patch.object(annotations_logger, "warning")
+@mock.patch.object(schema_logger, "warning")
+def test_parse_excluded_shipping_methods_response_invalid(
+    mocked_schema_logger, mocked_annotations_logger, app
+):
+    # given
+    response = {
+        "excluded_methods": [
+            {
+                "id": "not-an-id",
+            },
+        ]
+    }
+    webhook = Webhook.objects.create(
+        name="shipping-webhook-1",
+        app=app,
+        target_url="https://shipping-gateway.com/apiv2/",
+    )
+
+    # when
+    excluded_methods = get_excluded_shipping_methods_from_response(response, webhook)
+
+    # then
+    assert not excluded_methods
+    assert mocked_schema_logger.call_count == 1
+    assert (
+        "Malformed ShippingMethod id was provided:"
+        in mocked_schema_logger.call_args[0][0]
+    )
+    assert mocked_annotations_logger.call_count == 1
+    error_msg = mocked_annotations_logger.call_args[0][1]
+    assert "Skipping invalid shipping method (FilterShippingMethodsSchema)" in error_msg
 
 
 @mock.patch(
@@ -454,9 +498,12 @@ def test_order_shipping_methods(
     ]
     permission_group_manage_orders.user_set.add(staff_api_client.user)
     # when
-    response = staff_api_client.post_graphql(ORDER_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        ORDER_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
     content = get_graphql_content(response)
-    order_data = content["data"]["orders"]["edges"][0]["node"]
+    order_data = content["data"]["order"]
 
     shipping_methods = order_data["shippingMethods"]
     # then
@@ -485,26 +532,14 @@ def test_draft_order_shipping_methods(
         ExcludedShippingMethod(excluded_shipping_method_id, webhook_reason)
     ]
     permission_group_manage_orders.user_set.add(staff_api_client.user)
-    query = """
-      query DraftOrdersQuery {
-       draftOrders(first: 1) {
-         edges {
-           node {
-             shippingMethods {
-               id
-               name
-               active
-               message
-             }
-           }
-         }
-       }
-      }
-    """
+
     # when
-    response = staff_api_client.post_graphql(query)
+    response = staff_api_client.post_graphql(
+        ORDER_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
     content = get_graphql_content(response)
-    order_data = content["data"]["draftOrders"]["edges"][0]["node"]
+    order_data = content["data"]["order"]
 
     shipping_methods = order_data["shippingMethods"]
     # then
@@ -544,9 +579,12 @@ def test_order_shipping_methods_skips_sync_webhook_for_non_editable_statuses(
     permission_group_manage_orders.user_set.add(staff_api_client.user)
 
     # when
-    response = staff_api_client.post_graphql(ORDER_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        ORDER_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
     content = get_graphql_content(response)
-    order_data = content["data"]["orders"]["edges"][0]["node"]
+    order_data = content["data"]["order"]
 
     shipping_methods = order_data["shippingMethods"]
 
@@ -584,9 +622,12 @@ def test_order_available_shipping_methods(
     mocked_webhook.side_effect = respond
     permission_group_manage_orders.user_set.add(staff_api_client.user)
     # when
-    response = staff_api_client.post_graphql(ORDER_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        ORDER_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
     content = get_graphql_content(response)
-    order_data = content["data"]["orders"]["edges"][0]["node"]
+    order_data = content["data"]["order"]
 
     # then
     assert len(order_data["availableShippingMethods"]) == expected_count
@@ -595,25 +636,31 @@ def test_order_available_shipping_methods(
 @mock.patch(
     "saleor.plugins.webhook.plugin.WebhookPlugin.excluded_shipping_methods_for_checkout"
 )
-def test_checkout_shipping_methods(
+def test_checkout_deliveries(
     mocked_webhook,
     staff_api_client,
     checkout_ready_to_complete,
     permission_manage_checkouts,
     settings,
+    shipping_method_weight_based,
 ):
     # given
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     webhook_reason = "spanish-inquisition"
-    excluded_shipping_method_id = checkout_ready_to_complete.shipping_method.id
+    excluded_shipping_method_id = (
+        checkout_ready_to_complete.assigned_delivery.shipping_method_id
+    )
     mocked_webhook.return_value = [
         ExcludedShippingMethod(excluded_shipping_method_id, webhook_reason)
     ]
     staff_api_client.user.user_permissions.add(permission_manage_checkouts)
     # when
-    response = staff_api_client.post_graphql(CHECKOUT_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        CHECKOUT_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(checkout_ready_to_complete)},
+    )
     content = get_graphql_content(response)
-    checkout_data = content["data"]["checkouts"]["edges"][0]["node"]
+    checkout_data = content["data"]["checkout"]
 
     shipping_methods = checkout_data["shippingMethods"]
     # then
@@ -639,23 +686,27 @@ def test_checkout_available_shipping_methods(
     checkout_ready_to_complete,
     permission_manage_checkouts,
     settings,
+    shipping_method_weight_based,
 ):
     # given
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     webhook_reason = "spanish-inquisition"
 
-    excluded_shipping_method_id = checkout_ready_to_complete.shipping_method.id
+    excluded_shipping_method_id = (
+        checkout_ready_to_complete.assigned_delivery.shipping_method_id
+    )
     mocked_webhook.return_value = [
         ExcludedShippingMethod(excluded_shipping_method_id, webhook_reason)
     ]
 
     staff_api_client.user.user_permissions.add(permission_manage_checkouts)
     # when
-    response = staff_api_client.post_graphql(CHECKOUT_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        CHECKOUT_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(checkout_ready_to_complete)},
+    )
     content = get_graphql_content(response)
-    shipping_methods = content["data"]["checkouts"]["edges"][0]["node"][
-        "availableShippingMethods"
-    ]
+    shipping_methods = content["data"]["checkout"]["availableShippingMethods"]
     # then
     assert len(shipping_methods) == 1
     assert shipping_methods[0]["active"]
@@ -664,7 +715,7 @@ def test_checkout_available_shipping_methods(
 @mock.patch(
     "saleor.plugins.manager.PluginsManager.excluded_shipping_methods_for_checkout"
 )
-def test_checkout_shipping_methods_webhook_called_once(
+def test_checkout_deliveries_webhook_called_once(
     mocked_webhook,
     staff_api_client,
     checkout_ready_to_complete,
@@ -674,12 +725,17 @@ def test_checkout_shipping_methods_webhook_called_once(
     mocked_webhook.side_effect = [[], AssertionError("called twice.")]
     staff_api_client.user.user_permissions.add(permission_manage_checkouts)
     # when
-    response = staff_api_client.post_graphql(CHECKOUT_QUERY_SHIPPING_METHOD)
+    response = staff_api_client.post_graphql(
+        CHECKOUT_QUERY_SHIPPING_METHOD,
+        variables={"id": to_global_id_or_none(checkout_ready_to_complete)},
+    )
     content = get_graphql_content(response)
-    checkout_data = content["data"]["checkouts"]["edges"][0]["node"]
+    checkout_data = content["data"]["checkout"]
     # then
-    assert len(checkout_data["availableShippingMethods"]) == 2
-    assert len(checkout_data["shippingMethods"]) == 2
+    expected_count = ShippingMethod.objects.count()
+    assert len(checkout_data["availableShippingMethods"]) == expected_count
+    assert len(checkout_data["shippingMethods"]) == expected_count
+    assert mocked_webhook.called
 
 
 @mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
@@ -754,7 +810,7 @@ def test_excluded_shipping_methods_for_checkout_webhook_without_pregenerated_pay
         payload,
         shipping_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -842,7 +898,7 @@ def test_excluded_shipping_methods_for_checkout_webhook_with_subscription_base_p
         payload,
         shipping_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -984,7 +1040,7 @@ def test_multiple_app_with_excluded_shipping_methods_for_checkout(
         payload,
         shipping_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -995,7 +1051,7 @@ def test_multiple_app_with_excluded_shipping_methods_for_checkout(
         payload,
         second_shipping_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -1116,7 +1172,7 @@ def test_multiple_webhooks_on_the_same_app_with_excluded_shipping_methods_for_ch
         payload,
         first_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -1127,7 +1183,7 @@ def test_multiple_webhooks_on_the_same_app_with_excluded_shipping_methods_for_ch
         payload,
         second_webhook,
         False,
-        subscribable_object=checkout_with_items,
+        subscribable_object=(checkout_with_items, available_shipping_methods),
         timeout=settings.WEBHOOK_SYNC_TIMEOUT,
         request=None,
         requestor=None,
@@ -1246,15 +1302,22 @@ def test_get_excluded_shipping_methods_or_fetch_invalid_response_type(
     mocked_parse.assert_called_once_with([])
 
 
-def test_parse_list_shipping_methods_response_response_incorrect_format(app):
+@mock.patch.object(annotations_logger, "warning")
+def test_parse_list_shipping_methods_response_response_incorrect_format(
+    mocked_logger, app
+):
     # given
     response_data_with_incorrect_format = [[1], 2, "3"]
     # when
     result = parse_list_shipping_methods_response(
-        response_data_with_incorrect_format, app
+        response_data_with_incorrect_format, app, "USD"
     )
     # then
     assert result == []
+    # Ensure the warning about invalit method data wa logged
+    assert mocked_logger.call_count == len(response_data_with_incorrect_format)
+    error_msg = mocked_logger.call_args[0][1]
+    assert error_msg == "Skipping invalid shipping method (ListShippingMethodsSchema)"
 
 
 def test_parse_list_shipping_methods_with_metadata(app):
@@ -1272,7 +1335,7 @@ def test_parse_list_shipping_methods_with_metadata(app):
         }
     ]
     # when
-    response = parse_list_shipping_methods_response(response_data_with_meta, app)
+    response = parse_list_shipping_methods_response(response_data_with_meta, app, "USD")
     # then
     assert response[0].metadata == response_data_with_meta[0]["metadata"]
     assert response[0].description == response_data_with_meta[0]["description"]
@@ -1293,7 +1356,7 @@ def test_parse_list_shipping_methods_with_metadata_in_incorrect_format(app):
         }
     ]
     # when
-    response = parse_list_shipping_methods_response(response_data_with_meta, app)
+    response = parse_list_shipping_methods_response(response_data_with_meta, app, "USD")
     # then
     assert response[0].metadata == {}
 
@@ -1312,7 +1375,8 @@ def test_parse_list_shipping_methods_metadata_absent_in_response(app):
         }
     ]
     # when
-    response = parse_list_shipping_methods_response(response_data_with_meta, app)
+    response = parse_list_shipping_methods_response(response_data_with_meta, app, "USD")
+
     # then
     assert response[0].metadata == {}
 
@@ -1321,7 +1385,7 @@ def test_parse_list_shipping_methods_metadata_is_none(app):
     # given
     response_data_with_meta = [
         {
-            "id": 123,
+            "id": "123",
             "amount": 10,
             "currency": "USD",
             "name": "shipping",
@@ -1332,6 +1396,6 @@ def test_parse_list_shipping_methods_metadata_is_none(app):
         }
     ]
     # when
-    response = parse_list_shipping_methods_response(response_data_with_meta, app)
+    response = parse_list_shipping_methods_response(response_data_with_meta, app, "USD")
     # then
     assert response[0].metadata == {}

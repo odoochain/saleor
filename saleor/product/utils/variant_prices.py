@@ -55,9 +55,11 @@ def update_discounted_prices_for_promotion(
     changed_variant_listing_promotion_rule_to_create = []
     changed_variant_listing_promotion_rule_to_update = []
 
-    product_channel_listings = ProductChannelListing.objects.using(
-        settings.DATABASE_CONNECTION_REPLICA_NAME
-    ).filter(Exists(products.filter(id=OuterRef("product_id"))))
+    product_channel_listings = (
+        ProductChannelListing.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(Exists(products.filter(id=OuterRef("product_id"))))
+        .prefetch_related("channel")
+    )
     if only_dirty_products:
         product_channel_listings.filter(discounted_price_dirty=True)
 
@@ -188,12 +190,14 @@ def _get_product_to_variant_channel_listings_per_channel_map(
     variant_channel_listings = ProductVariantChannelListing.objects.filter(
         Exists(variants.filter(id=OuterRef("variant_id"))), price_amount__isnull=False
     )
-    variant_to_product_id = dict(variants.values_list("id", "product_id").iterator())
+    variant_to_product_id = dict(
+        variants.values_list("id", "product_id").iterator(chunk_size=1000)
+    )
 
     price_data: dict[int, dict[int, list[Money]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for variant_channel_listing in variant_channel_listings.iterator():
+    for variant_channel_listing in variant_channel_listings.iterator(chunk_size=1000):
         try:
             product_id = variant_to_product_id[variant_channel_listing.variant_id]
         except KeyError:

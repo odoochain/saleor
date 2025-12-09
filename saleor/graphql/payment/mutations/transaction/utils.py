@@ -1,5 +1,3 @@
-from typing import TYPE_CHECKING
-
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_ipv46_address
 
@@ -11,9 +9,6 @@ from .....permission.enums import PaymentPermissions
 from ....app.dataloaders import get_app_promise
 from ....core.utils import from_global_id_or_error
 from ...types import TransactionItem
-
-if TYPE_CHECKING:
-    pass
 
 
 def get_transaction_item(

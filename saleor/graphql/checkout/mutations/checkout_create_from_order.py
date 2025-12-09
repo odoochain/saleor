@@ -13,6 +13,7 @@ from ....product.models import ProductVariant
 from ....warehouse.availability import check_stock_and_preorder_quantity_bulk
 from ....warehouse.reservations import get_reservation_length, is_reservation_enabled
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.mutations import BaseMutation
 from ...core.types import BaseObjectType, Error, common
@@ -72,7 +73,7 @@ class CheckoutCreateFromOrder(BaseMutation):
         )
 
     class Meta:
-        description = "Create new checkout from existing order."
+        description = "Creates a new checkout from existing order."
         doc_category = DOC_CATEGORY_CHECKOUT
         error_type_class = CheckoutCreateFromOrderError
 
@@ -401,6 +402,9 @@ class CheckoutCreateFromOrder(BaseMutation):
         )
 
         if variants and valid_order_lines:
+            # Doesn't make sense to handle `NonExistingCheckout` here,
+            # as we just created the checkout above. No-one knows checkout's
+            # token except us.
             checkout = add_variants_to_checkout(
                 checkout,
                 variants,
@@ -418,5 +422,6 @@ class CheckoutCreateFromOrder(BaseMutation):
             )
         apply_gift_reward_if_applicable_on_checkout_creation(checkout)
         return CheckoutCreateFromOrder(
-            checkout=checkout, unavailable_variants=variant_errors
+            checkout=SyncWebhookControlContext(node=checkout),
+            unavailable_variants=variant_errors,
         )

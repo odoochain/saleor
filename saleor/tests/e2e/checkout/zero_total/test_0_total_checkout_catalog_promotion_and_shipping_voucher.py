@@ -18,10 +18,10 @@ from ..utils import (
 
 @pytest.mark.e2e
 @pytest.mark.parametrize(
-    ("mark_as_paid_strategy"),
+    "mark_as_paid_strategy",
     [
-        ("TRANSACTION_FLOW"),
-        ("PAYMENT_FLOW"),
+        "TRANSACTION_FLOW",
+        "PAYMENT_FLOW",
     ],
 )
 def test_complete_0_total_checkout_with_catalog_promotion_and_free_shipping_voucher_CORE_0126(
@@ -117,8 +117,6 @@ def test_complete_0_total_checkout_with_catalog_promotion_and_free_shipping_vouc
         lines,
         channel_slug,
         email="testEmail@example.com",
-        set_default_billing_address=True,
-        set_default_shipping_address=True,
     )
     checkout_id = checkout_data["id"]
 

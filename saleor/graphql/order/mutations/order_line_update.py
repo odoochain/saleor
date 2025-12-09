@@ -14,6 +14,7 @@ from ....order.utils import (
 from ....permission.enums import OrderPermissions
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.mutations import ModelWithRestrictedChannelAccessMutation
 from ...core.types import OrderError
 from ...plugins.dataloaders import get_plugin_manager_promise
@@ -70,13 +71,14 @@ class OrderLineUpdate(
         return cleaned_input
 
     @classmethod
-    def save(cls, info: ResolveInfo, instance, cleaned_input):
+    def save(cls, info: ResolveInfo, instance, cleaned_input, instance_tracker=None):
         manager = get_plugin_manager_promise(info.context).get()
 
+        order_is_unconfirmed = instance.order.is_unconfirmed()
         line_allocation = instance.allocations.first()
         warehouse_pk = (
             line_allocation.stock.warehouse.pk
-            if line_allocation and instance.order.is_unconfirmed()
+            if line_allocation and order_is_unconfirmed
             else None
         )
         app = get_app_promise(info.context).get()
@@ -87,6 +89,7 @@ class OrderLineUpdate(
                 variant=instance.variant,
                 warehouse_pk=warehouse_pk,
             )
+            order = instance.order
             try:
                 change_order_line_quantity(
                     info.context.user,
@@ -94,25 +97,28 @@ class OrderLineUpdate(
                     line_info,
                     instance.old_quantity,
                     instance.quantity,
-                    instance.order.channel,
+                    order,
                     manager,
+                    allocate_stock=order_is_unconfirmed,
                 )
             except InsufficientStock as e:
                 raise ValidationError(
                     "Cannot set new quantity because of insufficient stock.",
                     code=OrderErrorCode.INSUFFICIENT_STOCK.value,
                 ) from e
-            invalidate_order_prices(instance.order)
-            recalculate_order_weight(instance.order)
-            instance.order.save(update_fields=["should_refresh_prices", "weight"])
+            invalidate_order_prices(order)
+            recalculate_order_weight(order)
+            order.save(update_fields=["should_refresh_prices", "weight"])
 
-            call_event_by_order_status(instance.order, manager)
+            call_event_by_order_status(order, manager)
 
     @classmethod
     def success_response(cls, instance):
-        response = super().success_response(instance)
-        response.order = instance.order
-        return response
+        return cls(
+            orderLine=SyncWebhookControlContext(node=instance),
+            order=SyncWebhookControlContext(node=instance.order),
+            errors=[],
+        )
 
     @classmethod
     def get_instance_channel_id(cls, instance, **data):

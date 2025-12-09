@@ -4,6 +4,8 @@ from unittest.mock import call, patch
 
 import graphene
 import pytest
+from django.conf import settings
+from django.utils import timezone
 from django.utils.functional import SimpleLazyObject
 from django.utils.text import slugify
 from freezegun import freeze_time
@@ -47,6 +49,8 @@ CHANNEL_UPDATE_MUTATION = """
                     deleteExpiredOrdersAfter
                     allowUnpaidOrders
                     includeDraftOrderInVoucherUsage
+                    draftOrderLinePriceFreezePeriod
+                    useLegacyLineDiscountPropagation
                 }
             }
             errors{
@@ -1207,6 +1211,77 @@ def test_channel_update_order_settings_voucher_usage_enable(
     disconnect_voucher_codes_from_draft_orders_task_mock.assert_called_once()
 
 
+@pytest.mark.parametrize("new_freeze_period", [10, None, 0])
+def test_channel_update_draft_order_line_price_freeze_period(
+    new_freeze_period,
+    permission_manage_orders,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    assert channel_USD.draft_order_line_price_freeze_period == 24
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "orderSettings": {
+                "draftOrderLinePriceFreezePeriod": new_freeze_period,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_orders,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert (
+        channel_data["orderSettings"]["draftOrderLinePriceFreezePeriod"]
+        == new_freeze_period
+    )
+    assert channel_USD.draft_order_line_price_freeze_period == new_freeze_period
+
+
+def test_channel_update_draft_order_line_price_freeze_period_negative_value(
+    permission_manage_orders,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    assert channel_USD.draft_order_line_price_freeze_period == 24
+    new_freeze_period = -5
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "orderSettings": {
+                "draftOrderLinePriceFreezePeriod": new_freeze_period,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_orders,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["channelUpdate"]["errors"][0]
+    assert error["field"] == "draftOrderLinePriceFreezePeriod"
+    assert error["code"] == ChannelErrorCode.INVALID.name
+
+
 CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS = """
     mutation UpdateChannel($id: ID!,$input: ChannelUpdateInput!){
         channelUpdate(id: $id, input: $input){
@@ -1218,6 +1293,8 @@ CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS = """
                 checkoutSettings {
                     useLegacyErrorFlow
                     automaticallyCompleteFullyPaidCheckouts
+                    automaticCompletionDelay
+                    automaticCompletionCutOffDate
                 }
             }
             errors{
@@ -1232,6 +1309,7 @@ CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS = """
 """
 
 
+@freeze_time("2022-05-12 12:00:00")
 def test_channel_update_channel_settings(
     permission_manage_channels, staff_api_client, channel_USD
 ):
@@ -1269,12 +1347,472 @@ def test_channel_update_channel_settings(
         channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
         == automatically_complete_fully_paid_checkouts
     )
+    default_delay = 30
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] == default_delay
+    assert (
+        channel_data["checkoutSettings"]["automaticCompletionCutOffDate"]
+        == timezone.now().isoformat()
+    )
+
     channel_USD.refresh_from_db()
     assert channel_USD.use_legacy_error_flow_for_checkout == use_legacy_error_flow
     assert (
         channel_USD.automatically_complete_fully_paid_checkouts
         == automatically_complete_fully_paid_checkouts
     )
+    assert channel_USD.automatic_completion_delay == default_delay
+    assert channel_USD.automatic_completion_cut_off_date == timezone.now()
+
+
+@freeze_time("2022-05-12 12:00:00")
+def test_channel_update_set_automatic_checkout_completion(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticallyCompleteFullyPaidCheckouts": True,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    delay = settings.DEFAULT_AUTOMATIC_CHECKOUT_COMPLETION_DELAY
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is True
+    )
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] == delay
+    assert (
+        channel_data["checkoutSettings"]["automaticCompletionCutOffDate"]
+        == timezone.now().isoformat()
+    )
+    assert channel_USD.automatically_complete_fully_paid_checkouts is True
+    assert channel_USD.automatic_completion_delay == delay
+    assert channel_USD.automatic_completion_cut_off_date == timezone.now()
+
+
+def test_channel_update_set_automatic_checkout_completion_change_to_false(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    channel_USD.automatic_completion_delay = 10
+    channel_USD.automatically_complete_fully_paid_checkouts = True
+    channel_USD.save(
+        update_fields=[
+            "automatic_completion_delay",
+            "automatically_complete_fully_paid_checkouts",
+        ]
+    )
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticallyCompleteFullyPaidCheckouts": False,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert channel_USD.automatically_complete_fully_paid_checkouts is False
+    assert channel_USD.automatic_completion_delay is None
+    assert channel_USD.automatic_completion_cut_off_date is None
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is False
+    )
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] is None
+    assert channel_data["checkoutSettings"]["automaticCompletionCutOffDate"] is None
+
+
+def test_channel_update_set_automatic_checkout_completion_false(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": False,
+                },
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert channel_USD.automatically_complete_fully_paid_checkouts is False
+    assert channel_USD.automatic_completion_delay is None
+    assert channel_USD.automatic_completion_cut_off_date is None
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is False
+    )
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] is None
+    assert channel_data["checkoutSettings"]["automaticCompletionCutOffDate"] is None
+
+
+def test_channel_update_with_automatic_completion_delay_below_0(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": True,
+                    "delay": -1,
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["channelUpdate"]["errors"][0]
+    assert error["field"] == "delay"
+    assert error["code"] == ChannelErrorCode.INVALID.name
+
+
+def test_channel_update_with_delay_exceeding_threshold(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+    settings,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    oldest_allowed_checkout = (
+        settings.AUTOMATIC_CHECKOUT_COMPLETION_OLDEST_MODIFIED.total_seconds() // 60
+    )
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": True,
+                    "delay": oldest_allowed_checkout + 1,  # Exceeds threshold
+                },
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    errors = content["data"]["channelUpdate"]["errors"]
+    assert errors
+    assert errors[0]["field"] == "delay"
+    assert errors[0]["code"] == ChannelErrorCode.INVALID.name
+
+
+@freeze_time("2024-01-01 12:00:00")
+def test_channel_update_with_new_automatic_completion_enabled_with_default_delay(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": True,
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is True
+    )
+    default_delay = settings.DEFAULT_AUTOMATIC_CHECKOUT_COMPLETION_DELAY
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] == default_delay
+    assert channel_USD.automatically_complete_fully_paid_checkouts is True
+    assert channel_USD.automatic_completion_delay == default_delay
+    assert channel_USD.automatic_completion_cut_off_date == timezone.now()
+
+
+def test_channel_update_with_new_automatic_completion_enabled_with_custom_delay_and_cut_off(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    delay = 15
+    cut_off = timezone.now() + datetime.timedelta(days=5)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": True,
+                    "delay": delay,
+                    "cutOffDate": cut_off.isoformat(),
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is True
+    )
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] == delay
+    assert (
+        channel_data["checkoutSettings"]["automaticCompletionCutOffDate"]
+        == cut_off.isoformat()
+    )
+    assert channel_USD.automatically_complete_fully_paid_checkouts is True
+    assert channel_USD.automatic_completion_delay == delay
+    assert channel_USD.automatic_completion_cut_off_date == cut_off
+
+
+def test_channel_update_mutation_with_invalid_cutoff_date(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    invalid_cut_off_date = timezone.now() - datetime.timedelta(days=40)
+    variables = {
+        "id": graphene.Node.to_global_id("Channel", channel_USD.id),
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": True,
+                    "cutOffDate": invalid_cut_off_date.isoformat(),
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert data["errors"]
+    assert data["errors"][0]["field"] == "cutOffDate"
+    assert data["errors"][0]["code"] == ChannelErrorCode.INVALID.name
+
+
+def test_channel_update_with_new_automatic_completion_disabled(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    # Set initial state
+    channel_USD.automatically_complete_fully_paid_checkouts = True
+    channel_USD.automatic_completion_delay = 10
+    channel_USD.save(
+        update_fields=[
+            "automatically_complete_fully_paid_checkouts",
+            "automatic_completion_delay",
+        ]
+    )
+
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": False,
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert channel_USD.automatically_complete_fully_paid_checkouts is False
+    assert channel_USD.automatic_completion_delay is None
+    assert channel_USD.automatic_completion_cut_off_date is None
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        is False
+    )
+    assert channel_data["checkoutSettings"]["automaticCompletionDelay"] is None
+    assert channel_data["checkoutSettings"]["automaticCompletionCutOffDate"] is None
+
+
+def test_channel_update_with_new_automatic_completion_disabled_with_delay(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticCompletion": {
+                    "enabled": False,
+                    "delay": 10,
+                }
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["channelUpdate"]["errors"][0]
+    assert error["field"] == "delay"
+    assert error["code"] == ChannelErrorCode.INVALID.name
+
+
+def test_channel_update_with_both_old_and_new_automatic_completion_fields(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "checkoutSettings": {
+                "automaticallyCompleteFullyPaidCheckouts": True,
+                "automaticCompletion": {
+                    "enabled": True,
+                    "delay": 10,
+                },
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["channelUpdate"]["errors"][0]
+    assert error["field"] == "automaticallyCompleteFullyPaidCheckouts"
+    assert error["code"] == ChannelErrorCode.INVALID.name
 
 
 def test_channel_update_channel_settings_with_checkout_permission(
@@ -1463,6 +2001,9 @@ CHANNEL_UPDATE_MUTATION_WITH_PAYMENT_SETTINGS = """
                 currencyCode
                 paymentSettings {
                     defaultTransactionFlowStrategy
+                    releaseFundsForExpiredCheckouts
+                    checkoutTtlBeforeReleasingFunds
+                    checkoutReleaseFundsCutOffDate
                 }
             }
             errors{
@@ -1518,6 +2059,88 @@ def test_channel_update_default_transaction_flow_strategy(
     )
 
 
+def test_channel_update_checkout_release_settings(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    date = datetime.datetime(2022, 5, 12, 0, 0, 0, tzinfo=datetime.UTC)
+    ttl_before_releasing_funds = 7
+    variables = {
+        "id": channel_id,
+        "input": {
+            "paymentSettings": {
+                "releaseFundsForExpiredCheckouts": False,
+                "checkoutTtlBeforeReleasingFunds": ttl_before_releasing_funds,
+                "checkoutReleaseFundsCutOffDate": date,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_PAYMENT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    assert not channel_data["paymentSettings"]["releaseFundsForExpiredCheckouts"]
+    assert (
+        channel_data["paymentSettings"]["checkoutTtlBeforeReleasingFunds"]
+        == ttl_before_releasing_funds
+    )
+    assert (
+        channel_data["paymentSettings"]["checkoutReleaseFundsCutOffDate"]
+        == "2022-05-12T00:00:00+00:00"
+    )
+
+    channel_USD.refresh_from_db()
+    assert not channel_USD.release_funds_for_expired_checkouts
+    assert channel_USD.checkout_ttl_before_releasing_funds == datetime.timedelta(
+        hours=ttl_before_releasing_funds
+    )
+    assert channel_USD.checkout_release_funds_cut_off_date == date
+
+
+def test_channel_create_set_incorect_checkout_ttl_before_releasing_funds(
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    ttl_before_releasing_funds = 0
+    variables = {
+        "id": channel_id,
+        "input": {
+            "paymentSettings": {
+                "checkoutTtlBeforeReleasingFunds": ttl_before_releasing_funds,
+            },
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION_WITH_PAYMENT_SETTINGS,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    errors = content["data"]["channelUpdate"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["field"] == "checkoutTtlBeforeReleasingFunds"
+    assert errors[0]["code"] == ChannelErrorCode.INVALID.name
+
+
 def test_channel_update_default_transaction_flow_strategy_with_payment_permission(
     permission_manage_payments,
     staff_api_client,
@@ -1557,3 +2180,56 @@ def test_channel_update_default_transaction_flow_strategy_with_payment_permissio
         channel_USD.default_transaction_flow_strategy
         == TransactionFlowStrategyEnum.AUTHORIZATION.value
     )
+
+
+@pytest.mark.parametrize(
+    ("use_legacy_input", "expected_result", "current_value_on_db"),
+    [
+        ({"useLegacyLineDiscountPropagation": True}, True, True),
+        ({"useLegacyLineDiscountPropagation": True}, True, False),
+        ({"useLegacyLineDiscountPropagation": False}, False, True),
+        ({"useLegacyLineDiscountPropagation": False}, False, False),
+        (None, True, True),
+        (None, False, False),
+        ({"allowUnpaidOrders": False}, False, False),
+        ({"allowUnpaidOrders": True}, True, True),
+    ],
+)
+def test_channel_update_set_use_legacy_line_discount_propagation(
+    use_legacy_input,
+    expected_result,
+    current_value_on_db,
+    permission_manage_channels,
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    channel_USD.use_legacy_line_discount_propagation_for_order = current_value_on_db
+    channel_USD.save()
+
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": channel_id,
+        "input": {
+            "orderSettings": use_legacy_input,
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CHANNEL_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_channels,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["channelUpdate"]
+    assert not data["errors"]
+    channel_data = data["channel"]
+    channel_USD.refresh_from_db()
+    assert (
+        channel_data["orderSettings"]["useLegacyLineDiscountPropagation"]
+        == expected_result
+    )
+    assert channel_USD.use_legacy_line_discount_propagation_for_order == expected_result

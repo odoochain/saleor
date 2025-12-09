@@ -4,6 +4,7 @@ from unittest import mock
 
 from django.utils import timezone
 
+from ....webhook import const
 from ....webhook.event_types import WebhookEventSyncType
 from ....webhook.payloads import generate_checkout_payload
 from ....webhook.transport.shipping import (
@@ -26,7 +27,11 @@ def test_get_shipping_methods_for_checkout_webhook_response_none(
     mocked_webhook.return_value = None
 
     # when
-    response = plugin.get_shipping_methods_for_checkout(checkout, None)
+    response = plugin.get_shipping_methods_for_checkout(
+        checkout,
+        [],
+        None,
+    )
 
     # then
     assert not response
@@ -53,7 +58,7 @@ def test_get_shipping_methods_for_checkout_set_cache(
     plugin = webhook_plugin()
 
     # when
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert mocked_webhook.called
@@ -62,7 +67,7 @@ def test_get_shipping_methods_for_checkout_set_cache(
 
 @mock.patch("saleor.webhook.transport.synchronous.transport.cache.set")
 @mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-def test_get_shipping_methods_no_webhook_response_does_not_set_cache(
+def test_get_shipping_methods_no_webhook_response_sets_short_term_cache(
     mocked_webhook,
     mocked_cache_set,
     webhook_plugin,
@@ -71,14 +76,29 @@ def test_get_shipping_methods_no_webhook_response_does_not_set_cache(
 ):
     # given
     mocked_webhook.return_value = None
+
+    payload = generate_checkout_payload(checkout_with_item)
+    key_data = get_cache_data_for_shipping_list_methods_for_checkout(payload)
+    target_url = shipping_app.webhooks.first().target_url
+    cache_key = generate_cache_key_for_webhook(
+        key_data,
+        target_url,
+        WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT,
+        shipping_app.id,
+    )
+
     plugin = webhook_plugin()
 
     # when
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert mocked_webhook.called
-    assert not mocked_cache_set.called
+    mocked_cache_set.assert_called_once_with(
+        cache_key,
+        const.SYNC_WEBHOOK_FAILURE_SENTINEL,
+        timeout=const.SYNC_WEBHOOK_FAILURE_CACHE_TTL,
+    )
 
 
 @mock.patch("saleor.webhook.transport.synchronous.transport.cache.get")
@@ -102,7 +122,7 @@ def test_get_shipping_methods_for_checkout_use_cache(
     plugin = webhook_plugin()
 
     # when
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert not mocked_webhook.called
@@ -123,7 +143,7 @@ def test_get_shipping_methods_for_checkout_use_cache_for_empty_list(
     plugin = webhook_plugin()
 
     # when
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert not mocked_webhook.called
@@ -175,7 +195,7 @@ def test_checkout_change_invalidates_cache_key(
         WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT,
         shipping_app.id,
     )
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert cache_key != new_cache_key
@@ -232,7 +252,7 @@ def test_ignore_selected_fields_on_generating_cache_key(
         WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT,
         shipping_app.id,
     )
-    plugin.get_shipping_methods_for_checkout(checkout_with_item, None)
+    plugin.get_shipping_methods_for_checkout(checkout_with_item, [], None)
 
     # then
     assert cache_key == new_cache_key

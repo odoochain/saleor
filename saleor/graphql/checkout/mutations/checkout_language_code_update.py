@@ -4,6 +4,7 @@ from saleor.checkout.actions import call_checkout_event
 from saleor.webhook.event_types import WebhookEventAsyncType
 
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.descriptions import DEPRECATED_IN_3X_INPUT
 from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.enums import LanguageCodeEnum
@@ -39,7 +40,7 @@ class CheckoutLanguageCodeUpdate(BaseMutation):
         )
 
     class Meta:
-        description = "Update language code in the existing checkout."
+        description = "Updates language code in the existing checkout."
         doc_category = DOC_CATEGORY_CHECKOUT
         error_type_class = CheckoutError
         error_type_field = "checkout_errors"
@@ -72,4 +73,6 @@ class CheckoutLanguageCodeUpdate(BaseMutation):
             event_name=WebhookEventAsyncType.CHECKOUT_UPDATED,
             checkout=checkout,
         )
-        return CheckoutLanguageCodeUpdate(checkout=checkout)
+        return CheckoutLanguageCodeUpdate(
+            checkout=SyncWebhookControlContext(node=checkout)
+        )

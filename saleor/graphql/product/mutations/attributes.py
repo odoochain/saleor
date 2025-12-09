@@ -10,13 +10,16 @@ from ....core.tracing import traced_atomic_transaction
 from ....permission.enums import ProductPermissions, ProductTypePermissions
 from ....product import models
 from ....product.error_codes import ProductErrorCode
+from ....product.utils.search_helpers import (
+    mark_products_search_vector_as_dirty_in_batches,
+)
 from ...attribute.mutations import (
     BaseReorderAttributesMutation,
     BaseReorderAttributeValuesMutation,
 )
 from ...attribute.types import Attribute
-from ...channel import ChannelContext
 from ...core import ResolveInfo
+from ...core.context import ChannelContext
 from ...core.doc_category import DOC_CATEGORY_PRODUCTS
 from ...core.inputs import ReorderInput
 from ...core.mutations import BaseMutation
@@ -353,7 +356,12 @@ class ProductAttributeUnassign(BaseMutation):
         cls.save_field_values(product_type, "product_attributes", attribute_pks)
         cls.save_field_values(product_type, "variant_attributes", attribute_pks)
 
-        product_type.products.all().update(search_index_dirty=True)
+        product_ids = list(
+            models.Product.objects.filter(product_type=product_type).values_list(
+                "id", flat=True
+            )
+        )
+        mark_products_search_vector_as_dirty_in_batches(product_ids)
 
         return cls(product_type=product_type)
 

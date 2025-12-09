@@ -4,22 +4,21 @@ from graphene import relay
 from ....discount import DiscountValueType, models
 from ....permission.enums import DiscountPermissions
 from ....product.models import Category, Collection, Product, ProductVariant
-from ...channel import ChannelQsContext
-from ...channel.dataloaders import ChannelBySlugLoader
-from ...channel.types import (
-    Channel,
-    ChannelContext,
-    ChannelContextType,
-    ChannelContextTypeWithMetadata,
-)
+from ...channel.dataloaders.by_self import ChannelBySlugLoader
+from ...channel.types import Channel
 from ...core import ResolveInfo
 from ...core.connection import CountableConnection, create_connection_slice
-from ...core.context import get_database_connection_name
+from ...core.context import (
+    ChannelContext,
+    ChannelQsContext,
+    get_database_connection_name,
+)
 from ...core.descriptions import DEPRECATED_IN_3X_TYPE
 from ...core.doc_category import DOC_CATEGORY_DISCOUNTS
 from ...core.fields import ConnectionField, PermissionsField
 from ...core.scalars import DateTime
 from ...core.types import BaseObjectType, ModelObjectType, NonNullList
+from ...core.types.context import ChannelContextType
 from ...meta.types import ObjectWithMetadata
 from ...product.types import (
     CategoryCountableConnection,
@@ -64,7 +63,7 @@ class SaleChannelListing(BaseObjectType):
         doc_category = DOC_CATEGORY_DISCOUNTS
 
 
-class Sale(ChannelContextTypeWithMetadata, ModelObjectType[models.Promotion]):
+class Sale(ChannelContextType, ModelObjectType[models.Promotion]):
     id = graphene.GlobalID(required=True, description="The ID of the sale.")
     name = graphene.String(required=True, description="The name of the sale.")
     type = SaleType(required=True, description="Type of the sale, fixed or percentage.")

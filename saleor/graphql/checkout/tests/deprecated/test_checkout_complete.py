@@ -72,13 +72,14 @@ def test_checkout_complete(
     gift_card,
     payment_dummy,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
+    # given
     assert not gift_card.last_used_on
 
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -113,8 +114,11 @@ def test_checkout_complete(
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     redirect_url = "https://www.example.com"
     variables = {"checkoutId": checkout_id, "redirectUrl": redirect_url}
+
+    # when
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
 
+    # then
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
     assert not data["errors"]
@@ -135,7 +139,9 @@ def test_checkout_complete(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method_id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
     assert order.payments.exists()
     order_payment = order.payments.first()
     assert order_payment == payment
@@ -233,14 +239,14 @@ def test_checkout_complete_for_token_as_input(
     gift_card,
     payment_dummy,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     assert not gift_card.last_used_on
 
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -299,7 +305,9 @@ def test_checkout_complete_for_token_as_input(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
     assert order.payments.exists()
     order_payment = order.payments.first()
     assert order_payment == payment

@@ -9,8 +9,10 @@ import graphene
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.db import transaction
+from django.db.models import F
 
 from ..account.models import User
+from ..app.models import App
 from ..core.exceptions import AllocationError, InsufficientStock, InsufficientStockData
 from ..core.tracing import traced_atomic_transaction
 from ..core.transactions import transaction_with_commit_on_errors
@@ -20,25 +22,22 @@ from ..core.utils.events import (
     webhook_async_event_requires_sync_webhooks_to_trigger,
 )
 from ..giftcard import GiftCardLineData
-from ..order.utils import order_lines_qs_select_for_update
+from ..order.lock_objects import order_lines_qs_select_for_update
 from ..payment import (
     ChargeStatus,
     CustomPaymentChoices,
     PaymentError,
     TransactionAction,
     TransactionKind,
-    gateway,
 )
 from ..payment.interface import RefundData
 from ..payment.models import Payment, Transaction, TransactionItem
-from ..payment.utils import create_payment, create_transaction_for_order
 from ..plugins.manager import PluginsManager
 from ..shipping.models import ShippingMethodChannelListing
 from ..warehouse.management import (
     deallocate_stock,
-    deallocate_stock_for_order,
+    deallocate_stock_for_orders,
     decrease_stock,
-    get_order_lines_with_track_inventory,
 )
 from ..warehouse.models import Stock
 from ..webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
@@ -187,6 +186,103 @@ def _trigger_order_sync_webhooks(
         )
 
 
+def _get_extra_for_order_logger(order: "Order") -> dict:
+    return {
+        "order_id": order.id,
+        "currency": order.currency,
+        "status": order.status,
+        "origin": order.origin,
+        "checkout_id": order.checkout_token,
+        "undiscounted_base_shipping_price_amount": order.undiscounted_base_shipping_price_amount,
+        "base_shipping_price_amount": order.base_shipping_price_amount,
+        "shipping_price_net_amount": order.shipping_price_net_amount,
+        "shipping_price_gross_amount": order.shipping_price_gross_amount,
+        "undiscounted_total_net_amount": order.undiscounted_total_net_amount,
+        "total_net_amount": order.total_net_amount,
+        "undiscounted_total_gross_amount": order.undiscounted_total_gross_amount,
+        "total_gross_amount": order.total_gross_amount,
+        "subtotal_net_amount": order.subtotal_net_amount,
+        "subtotal_gross_amount": order.subtotal_gross_amount,
+        "has_voucher_code": bool(order.voucher_code),
+        "tax_exemption": order.tax_exemption,
+        "tax_error": order.tax_error,
+    }
+
+
+def _get_extra_for_order_line_logger(line: "OrderLine") -> dict:
+    return {
+        "line_id": line.id,
+        "variant_id": line.variant_id,
+        "quantity": line.quantity,
+        "is_gift_card": line.is_gift_card,
+        "is_price_overridden": line.is_price_overridden,
+        "unit_price_net_amount": line.unit_price_net_amount,
+        "unit_price_gross_amount": line.unit_price_gross_amount,
+        "total_price_net_amount": line.total_price_net_amount,
+        "total_price_gross_amount": line.total_price_gross_amount,
+        "has_voucher_code": line.voucher_code,
+        "unit_discount_amount": line.unit_discount_amount,
+        "unit_discount_type": line.unit_discount_type,
+        "unit_discount_reason": line.unit_discount_reason,
+    }
+
+
+def _order_has_negative_prices(order: "Order", lines: list["OrderLineInfo"]) -> bool:
+    if not order:
+        logger.error("Received None as order to check for negative prices")
+        return False
+
+    if list(
+        filter(
+            lambda x: x < 0,
+            [
+                order.shipping_price_net_amount,
+                order.shipping_price_gross_amount,
+                order.total_net_amount,
+                order.total_gross_amount,
+                order.subtotal_net_amount,
+                order.subtotal_gross_amount,
+            ],
+        )
+    ):
+        return True
+    if lines is None:
+        logger.error(
+            "Received None as order lines to check for negative prices",
+            extra=_get_extra_for_order_logger(order),
+        )
+        return False
+    for line_info in lines:
+        line = line_info.line
+        if not line:
+            logger.error(
+                "Received None as order line to check for negative prices",
+                extra=_get_extra_for_order_logger(order),
+            )
+            continue
+        if list(
+            filter(
+                lambda x: x < 0,
+                [
+                    line.unit_price_net_amount,
+                    line.unit_price_gross_amount,
+                    line.total_price_net_amount,
+                    line.total_price_gross_amount,
+                ],
+            )
+        ):
+            return True
+    return False
+
+
+def _log_order_with_negative_price(order: "Order", lines: list["OrderLineInfo"]):
+    extra = _get_extra_for_order_logger(order)
+    extra["lines"] = [
+        _get_extra_for_order_line_logger(line_info.line) for line_info in lines
+    ]
+    logger.error("Order with negative prices detected", extra=extra)
+
+
 def call_order_events(
     manager: "PluginsManager",
     event_names: list[str],
@@ -297,6 +393,10 @@ def order_created(
             extra={"tax_error": order.tax_error, "order_id": order_id},
         )
 
+    if order_user := order.user:
+        order_user.number_of_orders = F("number_of_orders") + 1
+        order_user.save(update_fields=["number_of_orders"])
+
     events.order_created_event(
         order=order, user=user, app=app, from_draft=from_draft, automatic=automatic
     )
@@ -339,6 +439,9 @@ def order_created(
     if channel.automatically_confirm_all_new_orders:
         order_confirmed(order, user, app, manager, webhook_event_map=webhook_event_map)
 
+    if _order_has_negative_prices(order, order_info.lines_data):
+        _log_order_with_negative_price(order, order_info.lines_data)
+
 
 def order_confirmed(
     order: "Order",
@@ -379,7 +482,7 @@ def handle_fully_paid_order(
     if order_info.customer_email:
         send_payment_confirmation(order_info, manager)
         if utils.order_needs_automatic_fulfillment(order_info.lines_data):
-            automatically_fulfill_digital_lines(order_info, manager)
+            automatically_fulfill_digital_lines(order_info, manager, user, app)
 
     if site_settings is None:
         site_settings = Site.objects.get_current().settings
@@ -418,7 +521,7 @@ def cancel_order(
     # transaction ensures proper allocation and event triggering
     with traced_atomic_transaction():
         events.order_canceled_event(order=order, user=user, app=app)
-        deallocate_stock_for_order(order, manager)
+        deallocate_stock_for_orders([order.id], manager)
         order.status = OrderStatus.CANCELED
         order.save(update_fields=["status", "updated_at"])
         if not webhook_event_map:
@@ -537,6 +640,8 @@ def order_fulfilled(
     gift_card_lines_info: list[GiftCardLineData],
     site_settings: "SiteSettings",
     notify_customer=True,
+    auto=False,
+    manually_approved=False,
     webhook_event_map: dict[str, set["Webhook"]] | None = None,
 ):
     from ..giftcard.utils import gift_cards_create
@@ -550,25 +655,33 @@ def order_fulfilled(
     # events are successfully created
     with traced_atomic_transaction():
         update_order_status(order)
-        gift_cards_create(
-            order,
-            gift_card_lines_info,
-            site_settings,
-            user,
-            app,
-            manager,
-        )
+        if gift_card_lines_info:
+            gift_cards_create(
+                order,
+                gift_card_lines_info,
+                site_settings,
+                user,
+                app,
+                manager,
+            )
         events.fulfillment_fulfilled_items_event(
-            order=order, user=user, app=app, fulfillment_lines=fulfillment_lines
+            order=order,
+            user=user,
+            app=app,
+            fulfillment_lines=fulfillment_lines,
+            auto=auto,
         )
         webhook_events = [WebhookEventAsyncType.ORDER_UPDATED]
         for fulfillment in fulfillments:
             call_event(manager.fulfillment_created, fulfillment, notify_customer)
 
-        if order.status == OrderStatus.FULFILLED:
+        order_fulfilled = order.status == OrderStatus.FULFILLED
+        if order_fulfilled:
             webhook_events.append(WebhookEventAsyncType.ORDER_FULFILLED)
+
+        if order_fulfilled or manually_approved:
             for fulfillment in fulfillments:
-                call_event(manager.fulfillment_approved, fulfillment)
+                call_event(manager.fulfillment_approved, fulfillment, notify_customer)
 
         call_order_events(
             manager,
@@ -578,8 +691,13 @@ def order_fulfilled(
         )
     if notify_customer:
         for fulfillment in fulfillments:
-            send_fulfillment_confirmation_to_customer(
-                order, fulfillment, user, app, manager
+            call_event(
+                send_fulfillment_confirmation_to_customer,
+                order,
+                fulfillment,
+                user,
+                app,
+                manager,
             )
 
 
@@ -633,6 +751,12 @@ def order_charged(
         events.payment_captured_event(
             order=order, user=user, app=app, amount=amount, payment=payment
         )
+
+    if order.status == OrderStatus.DRAFT:
+        # Skip charging events for draft orders
+        # They are going to be triggered when order is confirmed
+        return
+
     if webhook_event_map is None:
         webhook_event_map = get_webhooks_for_multiple_events(
             WEBHOOK_EVENTS_FOR_ORDER_CHARGED
@@ -782,6 +906,9 @@ def cancel_fulfillment(
                 fulfillment=fulfillment,
                 warehouse_pk=warehouse.pk,
             )
+        else:
+            decrease_fulfilled_quantity(fulfillment)
+
         fulfillment.status = FulfillmentStatus.CANCELED
         fulfillment.save(update_fields=["status"])
         update_order_status(fulfillment.order)
@@ -794,36 +921,14 @@ def cancel_fulfillment(
     return fulfillment
 
 
-def cancel_waiting_fulfillment(
-    fulfillment: Fulfillment,
-    user: User,
-    app: Optional["App"],
-    manager: "PluginsManager",
-):
-    """Cancel fulfillment which is in waiting for approval state."""
-    fulfillment = Fulfillment.objects.get(pk=fulfillment.pk)
-    # transaction ensures sending webhooks after order line is updated and events are
-    # successfully created
-    with traced_atomic_transaction():
-        events.fulfillment_canceled_event(
-            order=fulfillment.order, user=user, app=app, fulfillment=None
-        )
-
-        order_lines = []
-        for line in fulfillment:
-            order_line = line.order_line
-            order_line.quantity_fulfilled -= line.quantity
-            order_lines.append(order_line)
-        OrderLine.objects.bulk_update(order_lines, ["quantity_fulfilled"])
-
-        fulfillment.delete()
-        update_order_status(fulfillment.order)
-        call_event(manager.fulfillment_canceled, fulfillment)
-        call_order_event(
-            manager,
-            WebhookEventAsyncType.ORDER_UPDATED,
-            fulfillment.order,
-        )
+def decrease_fulfilled_quantity(fulfillment: Fulfillment) -> None:
+    """Decrease the fulfilled quantity for order lines in the given fulfillment."""
+    order_lines = []
+    for line in fulfillment:
+        order_line = line.order_line
+        order_line.quantity_fulfilled -= line.quantity
+        order_lines.append(order_line)
+    OrderLine.objects.bulk_update(order_lines, ["quantity_fulfilled"])
 
 
 def approve_fulfillment(
@@ -835,28 +940,17 @@ def approve_fulfillment(
     notify_customer=True,
     allow_stock_to_be_exceeded: bool = False,
 ):
-    from ..giftcard.utils import gift_cards_create
-
     with traced_atomic_transaction():
         fulfillment.status = FulfillmentStatus.FULFILLED
         fulfillment.save()
         order = fulfillment.order
-        if notify_customer:
-            send_fulfillment_confirmation_to_customer(
-                fulfillment.order, fulfillment, user, app, manager
-            )
-        events.fulfillment_fulfilled_items_event(
-            order=order,
-            user=user,
-            app=app,
-            fulfillment_lines=list(fulfillment.lines.all()),
-        )
         lines_to_fulfill = []
         gift_card_lines_info = []
         insufficient_stocks = []
-        for fulfillment_line in fulfillment.lines.all().prefetch_related(
+        fulfillment_lines = fulfillment.lines.all().prefetch_related(
             "order_line__variant"
-        ):
+        )
+        for fulfillment_line in fulfillment_lines:
             order_line = fulfillment_line.order_line
             variant = fulfillment_line.order_line.variant
 
@@ -896,34 +990,23 @@ def approve_fulfillment(
         if insufficient_stocks:
             raise InsufficientStock(insufficient_stocks)
 
-        _decrease_stocks(lines_to_fulfill, manager, allow_stock_to_be_exceeded)
-        order.refresh_from_db()
-        update_order_status(order)
-
-        webhook_event_map = get_webhooks_for_multiple_events(
-            WEBHOOK_EVENTS_FOR_ORDER_FULFILLED
-        )
-        webhook_events = [WebhookEventAsyncType.ORDER_UPDATED]
-        call_event(manager.fulfillment_approved, fulfillment, notify_customer)
-        if order.status == OrderStatus.FULFILLED:
-            webhook_events.append(WebhookEventAsyncType.ORDER_FULFILLED)
-
-        call_order_events(
+        decrease_stock(
+            lines_to_fulfill,
             manager,
-            webhook_events,
-            order,
-            webhook_event_map=webhook_event_map,
+            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
         )
-
-        if gift_card_lines_info:
-            gift_cards_create(
-                order,
-                gift_card_lines_info,
-                settings,
-                user,
-                app,
-                manager,
-            )
+        order.refresh_from_db()
+        order_fulfilled(
+            [fulfillment],
+            user,
+            app,
+            list(fulfillment_lines),
+            manager,
+            gift_card_lines_info,
+            settings,
+            notify_customer,
+            manually_approved=True,
+        )
 
     return fulfillment
 
@@ -940,6 +1023,9 @@ def mark_order_as_paid_with_transaction(
     Allows to create a transaction for an order.
     """
     with transaction.atomic():
+        # Circular imports
+        from ..payment.utils import create_transaction_for_order
+
         create_transaction_for_order(
             order=order,
             user=request_user,
@@ -981,6 +1067,9 @@ def mark_order_as_paid_with_payment(
     # transaction ensures that webhooks are triggered when payments and transactions are
     # properly created
     with traced_atomic_transaction():
+        # Circular imports
+        from ..payment.utils import create_payment
+
         payment = create_payment(
             gateway=CustomPaymentChoices.MANUAL,
             payment_token="",
@@ -1043,16 +1132,6 @@ def clean_mark_order_as_paid(order: "Order"):
         )
 
 
-def _decrease_stocks(order_lines_info, manager, allow_stock_to_be_exceeded=False):
-    lines_to_decrease_stock = get_order_lines_with_track_inventory(order_lines_info)
-    if lines_to_decrease_stock:
-        decrease_stock(
-            lines_to_decrease_stock,
-            manager,
-            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
-        )
-
-
 def _increase_order_line_quantity(order_lines_info):
     order_lines = []
     for line_info in order_lines_info:
@@ -1072,12 +1151,19 @@ def fulfill_order_lines(
     # transaction ensures that there is a consistency between quantities in order line
     # and stocks
     with traced_atomic_transaction():
-        _decrease_stocks(order_lines_info, manager, allow_stock_to_be_exceeded)
+        decrease_stock(
+            order_lines_info,
+            manager,
+            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+        )
         _increase_order_line_quantity(order_lines_info)
 
 
 def automatically_fulfill_digital_lines(
-    order_info: "OrderInfo", manager: "PluginsManager"
+    order_info: "OrderInfo",
+    manager: "PluginsManager",
+    user: User | None = None,
+    app: App | None = None,
 ):
     """Fulfill all digital lines which have enabled automatic fulfillment setting.
 
@@ -1125,6 +1211,9 @@ def automatically_fulfill_digital_lines(
 
         FulfillmentLine.objects.bulk_create(fulfillments)
         fulfill_order_lines(lines_info, manager)
+        events.fulfillment_fulfilled_items_event(
+            order=order, user=user, app=app, fulfillment_lines=fulfillments, auto=True
+        )
 
         send_fulfillment_confirmation_to_customer(
             order, fulfillment, user=order.user, app=None, manager=manager
@@ -1141,7 +1230,7 @@ def _create_fulfillment_lines(
     channel_slug: str,
     gift_card_lines_info: list[GiftCardLineData],
     manager: "PluginsManager",
-    decrease_stock: bool = True,
+    should_decrease_stock: bool = True,
     allow_stock_to_be_exceeded: bool = False,
 ) -> list[FulfillmentLine]:
     """Modify stocks and allocations. Return list of unsaved FulfillmentLines.
@@ -1162,7 +1251,7 @@ def _create_fulfillment_lines(
         gift_card_lines_info (List): List with information required
             to create gift cards.
         manager (PluginsManager): Plugin manager from given context
-        decrease_stock (Bool): Stocks will get decreased if this is True.
+        should_decrease_stock (Bool): Stocks will get decreased if this is True.
         allow_stock_to_be_exceeded (bool): If `True` then stock quantity could exceed.
             Default value is set to `False`.
 
@@ -1244,8 +1333,13 @@ def _create_fulfillment_lines(
         raise InsufficientStock(insufficient_stocks)
 
     if lines_info:
-        if decrease_stock:
-            _decrease_stocks(lines_info, manager, allow_stock_to_be_exceeded)
+        if should_decrease_stock:
+            decrease_stock(
+                lines_info,
+                manager,
+                allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+            )
+
         _increase_order_line_quantity(lines_info)
 
     return fulfillment_lines
@@ -1258,8 +1352,10 @@ def create_fulfillments(
     fulfillment_lines_for_warehouses: dict[UUID, list[OrderFulfillmentLineInfo]],
     manager: "PluginsManager",
     site_settings: "SiteSettings",
+    *,
     notify_customer: bool = True,
-    approved: bool = True,
+    auto: bool = False,
+    auto_approved: bool = True,
     allow_stock_to_be_exceeded: bool = False,
     tracking_number: str = "",
 ) -> list[Fulfillment]:
@@ -1287,7 +1383,8 @@ def create_fulfillments(
         notify_customer (bool): If `True` system send email about
             fulfillments to customer.
         site_settings (SiteSettings): Site settings used for creating gift cards.
-        approved (Boolean): fulfillments will have status fulfilled if it's True,
+        auto (Boolean): define if the fulfillment is automatic
+        auto_approved (Boolean): fulfillments will have status fulfilled if it's True,
             otherwise waiting_for_approval.
         allow_stock_to_be_exceeded (bool): If `True` then stock quantity could exceed.
             Default value is set to `False`.
@@ -1307,7 +1404,7 @@ def create_fulfillments(
     gift_card_lines_info: list[GiftCardLineData] = []
     status = (
         FulfillmentStatus.FULFILLED
-        if approved
+        if auto_approved
         else FulfillmentStatus.WAITING_FOR_APPROVAL
     )
 
@@ -1340,7 +1437,7 @@ def create_fulfillments(
                     order.channel.slug,
                     gift_card_lines_info,
                     manager,
-                    decrease_stock=approved,
+                    should_decrease_stock=auto_approved,
                     allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
                 )
             )
@@ -1349,28 +1446,25 @@ def create_fulfillments(
 
         FulfillmentLine.objects.bulk_create(fulfillment_lines)
         order.refresh_from_db()
-        if approved:
-            transaction.on_commit(
-                lambda: order_fulfilled(
-                    fulfillments,
-                    user,
-                    app,
-                    fulfillment_lines,
-                    manager,
-                    gift_card_lines_info,
-                    site_settings,
-                    notify_customer,
-                )
+        if auto_approved:
+            order_fulfilled(
+                fulfillments,
+                user,
+                app,
+                fulfillment_lines,
+                manager,
+                gift_card_lines_info,
+                site_settings,
+                notify_customer,
+                auto,
             )
         else:
-            transaction.on_commit(
-                lambda: order_awaits_fulfillment_approval(
-                    fulfillments,
-                    user,
-                    app,
-                    fulfillment_lines,
-                    manager,
-                )
+            order_awaits_fulfillment_approval(
+                fulfillments,
+                user,
+                app,
+                fulfillment_lines,
+                manager,
             )
     return fulfillments
 
@@ -1601,7 +1695,9 @@ def create_refund_fulfillment(
     return refunded_fulfillment
 
 
-def _populate_replace_order_fields(original_order: "Order"):
+def _populate_replace_order_fields(
+    original_order: "Order", replace_lines_count: int = 0
+) -> "Order":
     replace_order = Order()
     replace_order.status = OrderStatus.DRAFT
     replace_order.user_id = original_order.user_id
@@ -1615,6 +1711,7 @@ def _populate_replace_order_fields(original_order: "Order"):
     replace_order.origin = OrderOrigin.REISSUE
     replace_order.metadata = original_order.metadata
     replace_order.private_metadata = original_order.private_metadata
+    replace_order.lines_count = replace_lines_count
 
     if original_order.billing_address:
         original_order.billing_address.pk = None
@@ -1638,7 +1735,14 @@ def create_replace_order(
 ) -> "Order":
     """Create draft order with lines to replace."""
 
-    replace_order = _populate_replace_order_fields(original_order)
+    order_lines_with_fulfillment = OrderLine.objects.in_bulk(
+        [line_data.line.order_line_id for line_data in fulfillment_lines_to_replace]
+    )
+    replace_lines_count = len(
+        {line.line.id for line in order_lines_to_replace}
+        | set(order_lines_with_fulfillment.keys())
+    )
+    replace_order = _populate_replace_order_fields(original_order, replace_lines_count)
     order_line_to_create: dict[OrderLineIDType, OrderLine] = {}
     # transaction is needed to ensure data consistency for order lines
     with traced_atomic_transaction():
@@ -1656,9 +1760,6 @@ def create_replace_order(
             # items
             order_line_to_create[order_line_id] = order_line
 
-        order_lines_with_fulfillment = OrderLine.objects.in_bulk(
-            [line_data.line.order_line_id for line_data in fulfillment_lines_to_replace]
-        )
         for fulfillment_line_data in fulfillment_lines_to_replace:
             fulfillment_line = fulfillment_line_data.line
             order_line_id = fulfillment_line.order_line_id
@@ -1961,6 +2062,10 @@ def create_fulfillments_for_returned_products(
         ).delete()
 
         call_order_event(manager, WebhookEventAsyncType.ORDER_UPDATED, order)
+        if new_order:
+            call_order_event(
+                manager, WebhookEventAsyncType.DRAFT_ORDER_CREATED, new_order
+            )
     return return_fulfillment, replace_fulfillment, new_order
 
 
@@ -2026,7 +2131,10 @@ def _process_refund(
             amount += order.shipping_price_gross_amount
     if amount and payment:
         amount = min(payment.captured_amount, amount)
-        gateway.refund(
+        # Circular imports
+        from ..payment.gateway import refund
+
+        refund(
             payment,
             manager,
             amount=amount,

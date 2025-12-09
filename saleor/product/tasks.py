@@ -20,6 +20,7 @@ from ..plugins.manager import get_plugins_manager
 from ..warehouse.management import deactivate_preorder_for_variant
 from ..webhook.event_types import WebhookEventAsyncType
 from ..webhook.utils import get_webhooks_for_event
+from .lock_objects import product_qs_select_for_update
 from .models import Product, ProductChannelListing, ProductType, ProductVariant
 from .search import update_products_search_vector
 from .utils.product import mark_products_in_channels_as_dirty
@@ -89,7 +90,7 @@ def update_variants_names(product_type_pk: int, saved_attributes_ids: list[int])
             settings.DATABASE_CONNECTION_REPLICA_NAME
         ).get(pk=product_type_pk)
     except ObjectDoesNotExist:
-        logging.warning("Cannot find product type with id: %s.", product_type_pk)
+        logger.warning("Cannot find product type with id: %s.", product_type_pk)
         return
     saved_attributes = Attribute.objects.using(
         settings.DATABASE_CONNECTION_REPLICA_NAME
@@ -132,7 +133,7 @@ def _get_channel_to_products_map(rule_to_variant_list):
     )
 
     rule_to_channels_map = defaultdict(set)
-    for promotionrule_id, channel_id in promotion_channel_qs.iterator():
+    for promotionrule_id, channel_id in promotion_channel_qs.iterator(chunk_size=1000):
         rule_to_channels_map[promotionrule_id].add(channel_id)
     channel_to_products_map = defaultdict(set)
     for rule_to_variant in rule_to_variant_list:
@@ -195,10 +196,7 @@ def update_variant_relations_for_active_promotion_rules_task():
         # in the promotion as dirty
         existing_variant_relation = _get_existing_rule_variant_list(rules)
 
-        new_rule_to_variant_list = fetch_variants_for_promotion_rules(
-            rules=rules,
-            database_connection_name=settings.DATABASE_CONNECTION_REPLICA_NAME,
-        )
+        new_rule_to_variant_list = fetch_variants_for_promotion_rules(rules=rules)
         channel_to_product_map = _get_channel_to_products_map(
             existing_variant_relation + new_rule_to_variant_list
         )
@@ -293,6 +291,17 @@ def _get_preorder_variants_to_clean():
     return ProductVariant.objects.filter(
         is_preorder=True, preorder_end_date__lt=timezone.now()
     )
+
+
+@app.task
+@allow_writer()
+def mark_products_search_vector_as_dirty(product_ids: list[int]):
+    """Mark products as needing search index updates."""
+    if not product_ids:
+        return
+    with transaction.atomic():
+        ids = product_qs_select_for_update().filter(pk__in=product_ids).values("id")
+        Product.objects.filter(id__in=ids).update(search_index_dirty=True)
 
 
 @app.task(

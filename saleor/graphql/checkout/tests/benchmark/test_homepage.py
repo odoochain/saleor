@@ -1,10 +1,12 @@
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
 
-from .....checkout.utils import set_external_shipping_id
-from .....webhook.transport.shipping import to_shipping_app_id
+from .....checkout.models import CheckoutDelivery
+from .....checkout.utils import assign_shipping_method_to_checkout
+from .....webhook.transport.shipping_helpers import to_shipping_app_id
 from ....tests.utils import get_graphql_content
 
 
@@ -154,22 +156,38 @@ def test_user_checkout_details_with_external_shipping_method(
     customer_checkout,
     shipping_app,
     settings,
+    address,
 ):
     # given
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     external_id = to_shipping_app_id(app, "abcd")
+    shipping_name = "Provider - Economy"
+    shipping_price = Decimal(10)
+    currency = "USD"
     mock_json_response = [
         {
             "id": external_id,
-            "name": "Provider - Economy",
-            "amount": "10",
-            "currency": "USD",
+            "name": shipping_name,
+            "amount": shipping_price,
+            "currency": currency,
             "maximum_delivery_days": "7",
         }
     ]
+
     checkout = customer_checkout
-    checkout.shipping_method = None
-    set_external_shipping_id(checkout, external_id)
+
+    assigned_delivery = CheckoutDelivery.objects.create(
+        checkout=checkout,
+        external_shipping_method_id=external_id,
+        name=shipping_name,
+        price_amount=shipping_price,
+        currency="USD",
+        maximum_delivery_days=7,
+        is_external=True,
+    )
+
+    checkout.shipping_address = address
+    assign_shipping_method_to_checkout(checkout, assigned_delivery)
     checkout.save()
     mock_send_request.return_value = mock_json_response
     query = """

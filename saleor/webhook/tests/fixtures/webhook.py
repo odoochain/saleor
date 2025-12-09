@@ -111,6 +111,7 @@ def setup_checkout_webhooks(
 
     subscription {
       event {
+        issuedAt
         ... on CheckoutCreated {
           issuingPrincipal {
             ...IssuingPrincipal
@@ -128,6 +129,14 @@ def setup_checkout_webhooks(
           }
         }
         ... on CheckoutFullyPaid {
+          issuingPrincipal {
+            ...IssuingPrincipal
+          }
+          checkout {
+            ...CheckoutFragment
+          }
+        }
+        ... on CheckoutFullyAuthorized {
           issuingPrincipal {
             ...IssuingPrincipal
           }

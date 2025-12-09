@@ -11,7 +11,13 @@ from ..core.models import Job, ModelWithMetadata
 from ..permission.enums import AppPermission, BasePermissionEnum
 from ..permission.models import Permission
 from ..webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
-from .types import AppExtensionMount, AppExtensionTarget, AppType
+from .types import (
+    DEFAULT_APP_TARGET,
+    AppType,
+    DeprecatedAppExtensionHttpMethod,
+    DeprecatedAppExtensionMount,
+    DeprecatedAppExtensionTarget,
+)
 
 
 class AppQueryset(models.QuerySet["App"]):
@@ -125,7 +131,7 @@ class App(ModelWithMetadata):
 
 
 class AppTokenManager(models.Manager["AppToken"]):
-    def create(self, app, name="", auth_token=None, **extra_fields):
+    def create(self, *, app, name="", auth_token=None, **extra_fields):  # type: ignore[override]
         """Create an app token with the given name."""
         if not auth_token:
             auth_token = generate_token()
@@ -133,11 +139,6 @@ class AppTokenManager(models.Manager["AppToken"]):
         app_token.set_auth_token(auth_token)
         app_token.save()
         return app_token, auth_token
-
-    def create_with_token(self, *args, **kwargs) -> tuple["AppToken", str]:
-        # As `create` is waiting to be fixed, I'm using this proper method from future
-        # to get both AppToken and auth_token.
-        return self.create(*args, **kwargs)
 
 
 class AppToken(models.Model):
@@ -157,17 +158,25 @@ class AppExtension(models.Model):
     app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="extensions")
     label = models.CharField(max_length=256)
     url = models.URLField()
-    mount = models.CharField(choices=AppExtensionMount.CHOICES, max_length=256)
+    mount = models.CharField(
+        choices=DeprecatedAppExtensionMount.CHOICES, max_length=256
+    )
     target = models.CharField(
-        choices=AppExtensionTarget.CHOICES,
+        choices=DeprecatedAppExtensionTarget.CHOICES,
         max_length=128,
-        default=AppExtensionTarget.POPUP,
+        default=DEFAULT_APP_TARGET,
     )
     permissions = models.ManyToManyField(
         Permission,
         blank=True,
         help_text="Specific permissions for this app extension.",
     )
+    http_target_method = models.CharField(
+        blank=False,
+        null=True,
+        choices=DeprecatedAppExtensionHttpMethod.CHOICES,
+    )
+    settings = models.JSONField(blank=True, default=dict, db_default={})
 
 
 class AppInstallation(Job):

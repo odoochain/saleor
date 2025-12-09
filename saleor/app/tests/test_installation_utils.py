@@ -26,7 +26,7 @@ from ..installation_utils import (
     validate_app_install_response,
 )
 from ..models import App
-from ..types import AppExtensionMount, AppExtensionTarget
+from ..types import DeprecatedAppExtensionMount, DeprecatedAppExtensionTarget
 
 
 def test_validate_app_install_response():
@@ -90,9 +90,9 @@ def test_install_app_created_app(
         headers={
             "Content-Type": "application/json",
             # X- headers will be deprecated in Saleor 4.0, proper headers are without X-
-            "X-Saleor-Domain": "mirumee.com",
-            "Saleor-Domain": "mirumee.com",
-            "Saleor-Api-Url": "http://mirumee.com/graphql/",
+            "X-Saleor-Domain": "example.com",
+            "Saleor-Domain": "example.com",
+            "Saleor-Api-Url": "https://example.com/graphql/",
             "Saleor-Schema-Version": schema_version,
         },
         json={"auth_token": ANY},
@@ -274,6 +274,7 @@ def test_install_app_with_extension(
     # given
     label = "Create product with app"
     url = "http://127.0.0.1:8080/app-extension"
+    options: dict = {}
     app_manifest["permissions"] = ["MANAGE_PRODUCTS", "MANAGE_ORDERS"]
     app_manifest["extensions"] = [
         {
@@ -281,6 +282,7 @@ def test_install_app_with_extension(
             "url": url,
             "mount": "PRODUCT_OVERVIEW_CREATE",
             "permissions": ["MANAGE_PRODUCTS"],
+            "options": options,
         }
     ]
     mocked_get_response = Mock()
@@ -302,9 +304,58 @@ def test_install_app_with_extension(
 
     assert app_extension.label == label
     assert app_extension.url == url
-    assert app_extension.mount == AppExtensionMount.PRODUCT_OVERVIEW_CREATE
-    assert app_extension.target == AppExtensionTarget.POPUP
+    assert app_extension.mount == DeprecatedAppExtensionMount.PRODUCT_OVERVIEW_CREATE
+    assert app_extension.target == DeprecatedAppExtensionTarget.POPUP
     assert list(app_extension.permissions.all()) == [permission_manage_products]
+    assert app_extension.http_target_method is None
+
+
+def test_install_app_with_extension_widget(
+    app_manifest,
+    app_installation,
+    monkeypatch,
+    permission_manage_products,
+    permission_manage_orders,
+):
+    # given
+    label = "Create product with app"
+    url = "https://example.com/app-extension"
+    options = {"widgetTarget": {"method": "POST"}}
+    app_manifest["permissions"] = ["MANAGE_PRODUCTS", "MANAGE_ORDERS"]
+    app_manifest["tokenTargetUrl"] = "https://example.com/install"
+    app_manifest["extensions"] = [
+        {
+            "label": label,
+            "url": url,
+            "mount": "PRODUCT_DETAILS_WIDGETS",
+            "permissions": ["MANAGE_PRODUCTS"],
+            "target": "WIDGET",
+            "options": options,
+        }
+    ]
+    mocked_get_response = Mock()
+    mocked_get_response.json.return_value = app_manifest
+
+    monkeypatch.setattr(HTTPSession, "request", Mock(return_value=mocked_get_response))
+    monkeypatch.setattr("saleor.app.installation_utils.send_app_token", Mock())
+
+    app_installation.permissions.set(
+        [permission_manage_products, permission_manage_orders]
+    )
+
+    # when
+    app, _ = install_app(app_installation, activate=True)
+
+    # then
+    assert App.objects.get().id == app.id
+    app_extension = app.extensions.get()
+
+    assert app_extension.label == label
+    assert app_extension.url == url
+    assert app_extension.mount == DeprecatedAppExtensionMount.PRODUCT_DETAILS_WIDGETS
+    assert app_extension.target == DeprecatedAppExtensionTarget.WIDGET
+    assert list(app_extension.permissions.all()) == [permission_manage_products]
+    assert app_extension.http_target_method == "POST"
 
 
 @pytest.mark.parametrize(
@@ -343,6 +394,49 @@ def test_install_app_extension_permission_out_of_scope(
     # when & then
     with pytest.raises(ValidationError):
         install_app(app_installation, activate=True)
+
+
+def test_install_app_with_extension_new_tab_target(
+    app_manifest,
+    app_installation,
+    monkeypatch,
+    permission_manage_products,
+):
+    # given
+    label = "Open in new tab"
+    url = "http://127.0.0.1:8080/app-extension"
+    options = {"newTabTarget": {"method": "GET"}}
+    app_manifest["permissions"] = ["MANAGE_PRODUCTS"]
+    app_manifest["extensions"] = [
+        {
+            "label": label,
+            "url": url,
+            "mount": "PRODUCT_OVERVIEW_CREATE",
+            "permissions": ["MANAGE_PRODUCTS"],
+            "options": options,
+            "target": "NEW_TAB",
+        }
+    ]
+    mocked_get_response = Mock()
+    mocked_get_response.json.return_value = app_manifest
+
+    monkeypatch.setattr(HTTPSession, "request", Mock(return_value=mocked_get_response))
+    monkeypatch.setattr("saleor.app.installation_utils.send_app_token", Mock())
+
+    app_installation.permissions.set([permission_manage_products])
+
+    # when
+    app, _ = install_app(app_installation, activate=True)
+
+    # then
+    assert App.objects.get().id == app.id
+    app_extension = app.extensions.get()
+    assert app_extension.label == label
+    assert app_extension.url == url
+    assert app_extension.mount == DeprecatedAppExtensionMount.PRODUCT_OVERVIEW_CREATE
+    assert app_extension.target == "new_tab"
+    assert list(app_extension.permissions.all()) == [permission_manage_products]
+    assert app_extension.http_target_method == "GET"
 
 
 @pytest.mark.parametrize(
@@ -450,6 +544,51 @@ def test_install_app_extension_incorrect_values(
     # when & then
     with pytest.raises(ValidationError):
         install_app(app_installation, activate=True)
+
+
+def test_install_app_with_extension_post_method(
+    app_manifest,
+    app_installation,
+    monkeypatch,
+    permission_manage_products,
+):
+    # given
+    label = "Create product with app"
+    url = "https://example.com/extension"  # extension url must be under the same origin as app
+    options = {"newTabTarget": {"method": "POST"}}
+    app_manifest["tokenTargetUrl"] = "https://example.com/install"
+    app_manifest["permissions"] = ["MANAGE_PRODUCTS"]
+    app_manifest["extensions"] = [
+        {
+            "label": label,
+            "url": url,
+            "mount": "PRODUCT_OVERVIEW_CREATE",
+            "permissions": ["MANAGE_PRODUCTS"],
+            "options": options,
+            "target": "NEW_TAB",
+        }
+    ]
+    mocked_get_response = Mock()
+    mocked_get_response.json.return_value = app_manifest
+
+    monkeypatch.setattr(HTTPSession, "request", Mock(return_value=mocked_get_response))
+    monkeypatch.setattr("saleor.app.installation_utils.send_app_token", Mock())
+
+    app_installation.permissions.set([permission_manage_products])
+
+    # when
+    app, _ = install_app(app_installation, activate=True)
+
+    # then
+    assert App.objects.get().id == app.id
+    app_extension = app.extensions.get()
+
+    assert app_extension.label == label
+    assert app_extension.url == url
+    assert app_extension.mount == DeprecatedAppExtensionMount.PRODUCT_OVERVIEW_CREATE
+    assert app_extension.target == DeprecatedAppExtensionTarget.NEW_TAB
+    assert list(app_extension.permissions.all()) == [permission_manage_products]
+    assert app_extension.http_target_method == "POST"
 
 
 def test_install_app_with_webhook(
@@ -701,14 +840,6 @@ def test_fetch_icon_image_file_too_big(mock_get_request, image_response_mock):
     assert "File too big. Maximal icon image file size is" in error.value.message
 
 
-@patch.object(HTTPSession, "request")
-def test_fetch_icon_image_network_error(mock_get_request):
-    mock_get_request.side_effect = requests.RequestException
-    with pytest.raises(ValidationError) as error:
-        fetch_icon_image("https://example.com/logo.png")
-    assert error.value.code == AppErrorCode.MANIFEST_URL_CANT_CONNECT.value
-
-
 @pytest.mark.parametrize("app_object", ["app", "app_installation"])
 @patch("saleor.app.installation_utils.fetch_icon_image")
 def test_fetch_brand_data_task(
@@ -772,7 +903,9 @@ def test_fetch_brand_data_task_retry(
 ):
     # given
     brand_data = {"logo": {"default": "https://example.com/logo.png"}}
-    mock_fetch_icon_image.side_effect = ValidationError("Fetch image error")
+    mock_fetch_icon_image.side_effect = requests.exceptions.RequestException(
+        "Fetch image network error"
+    )
 
     # when
     with pytest.raises(Retry):

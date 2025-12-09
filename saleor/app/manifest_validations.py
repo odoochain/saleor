@@ -21,7 +21,7 @@ from ..webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ..webhook.validators import custom_headers_validator
 from .error_codes import AppErrorCode
 from .models import App
-from .types import AppExtensionMount, AppExtensionTarget
+from .types import DEFAULT_APP_TARGET
 from .validators import AppURLValidator, brand_validator
 
 logger = logging.getLogger(__name__)
@@ -42,23 +42,7 @@ def _clean_app_url(url):
     url_validator(url)
 
 
-def _clean_extension_url_with_only_path(
-    manifest_data: dict, target: str, extension_url: str
-):
-    if target == AppExtensionTarget.APP_PAGE:
-        return
-    if manifest_data["appUrl"]:
-        _clean_app_url(manifest_data["appUrl"])
-    else:
-        msg = (
-            "Incorrect relation between extension's target and URL fields. "
-            "APP_PAGE can be used only with relative URL path."
-        )
-        logger.warning(msg, extra={"target": target, "url": extension_url})
-        raise ValidationError(msg)
-
-
-def clean_extension_url(extension: dict, manifest_data: dict):
+def _clean_extension_url(extension: dict, manifest_data: dict):
     """Clean assigned extension url.
 
     Make sure that format of url is correct based on the rest of manifest fields.
@@ -68,14 +52,16 @@ def clean_extension_url(extension: dict, manifest_data: dict):
     - url cannot start with protocol when target == "APP_PAGE"
     """
     extension_url = extension["url"]
-    target = extension.get("target") or AppExtensionTarget.POPUP
-    if extension_url.startswith("/"):
-        _clean_extension_url_with_only_path(manifest_data, target, extension_url)
-    elif target == AppExtensionTarget.APP_PAGE:
-        msg = "Url cannot start with protocol when target == APP_PAGE"
-        logger.warning(msg)
-        raise ValidationError(msg)
-    else:
+
+    # Assume app URL is the one that originally received the token.
+    app_url = manifest_data.get("tokenTargetUrl")
+
+    if not app_url:
+        raise ValidationError("Manifest is invalid, token_target_url is missing")
+
+    # Only validate absolute URLs (with protocol)
+    # Relative URLs (starting with '/') are allowed when tokenTargetUrl is provided
+    if not extension_url.startswith("/"):
         _clean_app_url(extension_url)
 
 
@@ -88,7 +74,7 @@ def clean_manifest_url(manifest_url):
         raise ValidationError({"manifest_url": ValidationError(msg, code=code)}) from e
 
 
-def clean_permissions(
+def _clean_permissions(
     required_permissions: list[str], saleor_permissions: Iterable[Permission]
 ) -> list[Permission]:
     missing_permissions = []
@@ -110,7 +96,7 @@ def clean_permissions(
 def clean_manifest_data(manifest_data, raise_for_saleor_version=False):
     errors: T_ERRORS = defaultdict(list)
 
-    validate_required_fields(manifest_data, errors)
+    _validate_required_fields(manifest_data, errors)
 
     try:
         if "tokenTargetUrl" in manifest_data:
@@ -124,14 +110,14 @@ def clean_manifest_data(manifest_data, raise_for_saleor_version=False):
         )
 
     try:
-        manifest_data["requiredSaleorVersion"] = clean_required_saleor_version(
+        manifest_data["requiredSaleorVersion"] = _clean_required_saleor_version(
             manifest_data.get("requiredSaleorVersion"), raise_for_saleor_version
         )
     except ValidationError as e:
         errors["requiredSaleorVersion"].append(e)
 
     try:
-        manifest_data["author"] = clean_author(manifest_data.get("author"))
+        manifest_data["author"] = _clean_author(manifest_data.get("author"))
     except ValidationError as e:
         errors["author"].append(e)
 
@@ -144,7 +130,7 @@ def clean_manifest_data(manifest_data, raise_for_saleor_version=False):
         formatted_codename=Concat("content_type__app_label", Value("."), "codename")
     )
     try:
-        app_permissions = clean_permissions(
+        app_permissions = _clean_permissions(
             manifest_data.get("permissions", []), saleor_permissions
         )
     except ValidationError as e:
@@ -159,12 +145,13 @@ def clean_manifest_data(manifest_data, raise_for_saleor_version=False):
     ):
         errors["identifier"].append(
             ValidationError(
-                f"App with the same identifier is already installed: {app.name}"
+                f"App with the same identifier is already installed: {app.name}",
+                code=AppErrorCode.UNIQUE.value,
             )
         )
     if not errors:
-        clean_extensions(manifest_data, app_permissions, errors)
-        clean_webhooks(manifest_data, errors)
+        _clean_extensions(manifest_data, app_permissions, errors)
+        _clean_webhooks(manifest_data, errors)
 
     if errors:
         raise ValidationError(errors)
@@ -173,7 +160,7 @@ def clean_manifest_data(manifest_data, raise_for_saleor_version=False):
 def _clean_extension_permissions(extension, app_permissions, errors):
     permissions_data = extension.get("permissions", [])
     try:
-        extension_permissions = clean_permissions(permissions_data, app_permissions)
+        extension_permissions = _clean_permissions(permissions_data, app_permissions)
     except ValidationError as e:
         if e.params is None:
             e.params = {}
@@ -192,29 +179,19 @@ def _clean_extension_permissions(extension, app_permissions, errors):
     extension["permissions"] = extension_permissions
 
 
-def clean_extension_enum_field(enum, field_name, extension, errors):
-    if extension[field_name] in [code.upper() for code, _ in enum.CHOICES]:
-        extension[field_name] = getattr(enum, extension[field_name])
-    else:
-        errors["extensions"].append(
-            ValidationError(
-                f"Incorrect value for field: {field_name}",
-                code=AppErrorCode.INVALID.value,
-            )
-        )
-
-
-def clean_extensions(manifest_data, app_permissions, errors):
+def _clean_extensions(manifest_data, app_permissions, errors):
     extensions = manifest_data.get("extensions", [])
+
     for extension in extensions:
         if "target" not in extension:
-            extension["target"] = AppExtensionTarget.POPUP
-        else:
-            clean_extension_enum_field(AppExtensionTarget, "target", extension, errors)
-        clean_extension_enum_field(AppExtensionMount, "mount", extension, errors)
+            extension["target"] = DEFAULT_APP_TARGET
+
+        # Save in lowercase to maintain backwards compatibility with enums, that were used previously
+        extension["target"] = extension["target"].lower()
+        extension["mount"] = extension["mount"].lower()
 
         try:
-            clean_extension_url(extension, manifest_data)
+            _clean_extension_url(extension, manifest_data)
         except (ValidationError, AttributeError):
             errors["extensions"].append(
                 ValidationError(
@@ -222,10 +199,11 @@ def clean_extensions(manifest_data, app_permissions, errors):
                     code=AppErrorCode.INVALID_URL_FORMAT.value,
                 )
             )
+
         _clean_extension_permissions(extension, app_permissions, errors)
 
 
-def clean_webhooks(manifest_data, errors):
+def _clean_webhooks(manifest_data, errors):
     webhooks = manifest_data.get("webhooks", [])
 
     async_types = {
@@ -305,7 +283,7 @@ def clean_webhooks(manifest_data, errors):
                 )
 
 
-def validate_required_fields(manifest_data, errors):
+def _validate_required_fields(manifest_data, errors):
     manifest_required_fields = {"id", "version", "name", "tokenTargetUrl"}
     extension_required_fields = {"label", "url", "mount"}
     webhook_required_fields = {"name", "targetUrl", "query"}
@@ -341,11 +319,11 @@ def validate_required_fields(manifest_data, errors):
             )
 
 
-def parse_version(version_str: str) -> Version:
+def _parse_version(version_str: str) -> Version:
     return Version(version_str)
 
 
-def clean_required_saleor_version(
+def _clean_required_saleor_version(
     required_version,
     raise_for_saleor_version: bool,
     saleor_version=__version__,
@@ -357,7 +335,7 @@ def clean_required_saleor_version(
     except Exception as e:
         msg = "Incorrect value for required Saleor version."
         raise ValidationError(msg, code=AppErrorCode.INVALID.value) from e
-    version = parse_version(saleor_version)
+    version = _parse_version(saleor_version)
     satisfied = spec.match(version)
     if raise_for_saleor_version and not satisfied:
         msg = f"Saleor version {saleor_version} is not supported by the app."
@@ -365,7 +343,7 @@ def clean_required_saleor_version(
     return {"constraint": required_version, "satisfied": satisfied}
 
 
-def clean_author(author) -> str | None:
+def _clean_author(author) -> str | None:
     if author is None:
         return None
     if isinstance(author, str):

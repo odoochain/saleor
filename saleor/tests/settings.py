@@ -1,12 +1,7 @@
-import os
 import re
 from re import Pattern
 
 from django.utils.functional import SimpleLazyObject
-
-# Disable Jaeger tracing should be done before importing settings.
-# without this line pytest will start sending traces to Jaeger agent.
-os.environ["JAEGER_AGENT_HOST"] = ""
 
 from ..settings import *  # noqa: F403
 
@@ -28,6 +23,7 @@ POPULATE_DEFAULTS = False
 
 CELERY_TASK_ALWAYS_EAGER = True
 
+PUBLIC_URL = "https://example.com"
 SECRET_KEY = "NOTREALLY"
 
 ALLOWED_CLIENT_HOSTS = ["www.example.com"]
@@ -38,7 +34,6 @@ COUNTRIES_ONLY = None
 
 MEDIA_ROOT = ""
 MEDIA_URL = "/media/"
-MAX_CHECKOUT_LINE_QUANTITY = 50
 
 AUTH_PASSWORD_VALIDATORS = []
 
@@ -101,3 +96,11 @@ CELERY_RESTRICT_WRITER_METHOD = "saleor.core.db.connection.restrict_writer"
 
 PRIVATE_FILE_STORAGE = "saleor.tests.storages.PrivateFileSystemStorage"
 PRIVATE_MEDIA_ROOT: str = os.path.join(PROJECT_ROOT, "private-media")  # noqa: F405
+
+BREAKER_BOARD_ENABLED = False
+
+# Enable exception raising for telemetry unit conversion errors
+# This helps identify unit conversion issues during development and testing
+TELEMETRY_RAISE_UNIT_CONVERSION_ERRORS = True
+TELEMETRY_TRACER_CLASS = "saleor.core.telemetry.tests.TestTracer"
+TELEMETRY_METER_CLASS = "saleor.core.telemetry.tests.TestMeter"

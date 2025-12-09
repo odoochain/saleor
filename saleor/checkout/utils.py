@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Optional, cast
 from uuid import UUID
 
 import graphene
@@ -14,10 +14,19 @@ from django.utils import timezone
 from prices import Money
 
 from ..account.models import User
-from ..checkout.fetch import update_delivery_method_lists_for_checkout_info
 from ..core.db.connection import allow_writer
-from ..core.exceptions import NonExistingCheckoutLines, ProductNotPublished
+from ..core.exceptions import (
+    NonExistingCheckout,
+    NonExistingCheckoutLines,
+    ProductNotPublished,
+)
+from ..core.prices import quantize_price
 from ..core.taxes import zero_taxed_money
+from ..core.utils.metadata_manager import (
+    MetadataItemCollection,
+    MetadataType,
+    store_on_instance,
+)
 from ..core.utils.promo_code import (
     InvalidPromoCode,
     promo_code_is_gift_card,
@@ -55,17 +64,19 @@ from ..warehouse.models import Warehouse
 from ..warehouse.reservations import reserve_stocks_and_preorders
 from . import AddressType, base_calculations, calculations
 from .error_codes import CheckoutErrorCode
-from .models import Checkout, CheckoutLine, CheckoutMetadata
+from .lock_objects import (
+    checkout_lines_qs_select_for_update,
+    checkout_qs_select_for_update,
+)
+from .models import Checkout, CheckoutDelivery, CheckoutLine, CheckoutMetadata
 
 if TYPE_CHECKING:
     from measurement.measures import Weight
 
     from ..account.models import Address
-    from ..core.models import ModelWithMetadata
     from ..core.pricing.interface import LineInfo
-    from ..order.models import Order, OrderLine
+    from ..order.models import OrderLine
     from .fetch import CheckoutInfo, CheckoutLineInfo
-
 
 PRIVATE_META_APP_SHIPPING_ID = "external_app_shipping_id"
 
@@ -108,17 +119,15 @@ def invalidate_checkout_prices(
     """Mark checkout as ready for prices recalculation."""
     checkout = checkout_info.checkout
 
-    checkout.price_expiration = timezone.now()
-    updated_fields = ["price_expiration", "last_change"]
+    price_expiration = timezone.now()
+    checkout.price_expiration = price_expiration
+    checkout.discount_expiration = price_expiration
+    updated_fields = ["price_expiration", "discount_expiration", "last_change"]
 
     if save:
         checkout.save(update_fields=updated_fields)
 
     return updated_fields
-
-
-def checkout_lines_qs_select_for_update():
-    return CheckoutLine.objects.order_by("id").select_for_update(of=(["self"]))
 
 
 def checkout_lines_bulk_update(
@@ -275,7 +284,10 @@ def add_variant_to_checkout(
         line.save(update_fields=["quantity"])
 
     # invalidate calculated prices
-    checkout.price_expiration = timezone.now()
+    price_expiration = timezone.now()
+    checkout.price_expiration = price_expiration
+    checkout.discount_expiration = price_expiration
+
     return checkout
 
 
@@ -303,6 +315,17 @@ def add_variants_to_checkout(
     """
     country_code = checkout.get_country()
     with transaction.atomic():
+        # We need to lock checkout first to avoid deadlocks.
+        # When this function try to create new lines, the checkout is locked after
+        # the lines are locked manually. We should always lock checkout first to
+        # avoid deadlocks.
+        try:
+            _locked_checkout = (
+                checkout_qs_select_for_update().only("pk").get(token=checkout.token)
+            )
+        except Checkout.DoesNotExist as e:
+            raise NonExistingCheckout(checkout.token) from e
+
         checkout_lines = list(
             checkout_lines_qs_select_for_update()
             .select_related("variant")
@@ -354,6 +377,8 @@ def add_variants_to_checkout(
             )
 
         if to_create:
+            # This operation is safe to do without locking as we already locked checkout
+            # on the beginning of this transaction.
             CheckoutLine.objects.bulk_create(to_create)
 
         to_reserve = to_create + to_update
@@ -466,7 +491,9 @@ def _check_new_checkout_address(checkout, address, address_type):
     return has_address_changed, remove_old_address
 
 
-def change_billing_address_in_checkout(checkout, address) -> list[str]:
+def change_billing_address_in_checkout(
+    checkout: "Checkout", address: "Address", store_in_user_addresses: bool
+) -> list[str]:
     """Save billing address in checkout if changed.
 
     Remove previously saved address if not connected to any user.
@@ -479,18 +506,19 @@ def change_billing_address_in_checkout(checkout, address) -> list[str]:
     updated_fields = []
     if changed:
         if remove:
-            checkout.billing_address.delete()
+            checkout.billing_address.delete()  # type: ignore[union-attr]
         checkout.billing_address = address
         updated_fields = ["billing_address", "last_change"]
+    if checkout.save_billing_address != store_in_user_addresses:
+        checkout.save_billing_address = store_in_user_addresses
+        updated_fields.append("save_billing_address")
     return updated_fields
 
 
 def change_shipping_address_in_checkout(
     checkout_info: "CheckoutInfo",
     address: "Address",
-    lines: list["CheckoutLineInfo"],
-    manager: "PluginsManager",
-    shipping_channel_listings: Iterable["ShippingMethodChannelListing"],
+    store_in_user_addresses: bool,
 ):
     """Save shipping address in checkout if changed.
 
@@ -507,15 +535,11 @@ def change_shipping_address_in_checkout(
         if remove and checkout.shipping_address:
             checkout.shipping_address.delete()
         checkout.shipping_address = address
-        update_delivery_method_lists_for_checkout_info(
-            checkout_info=checkout_info,
-            shipping_method=checkout_info.checkout.shipping_method,
-            collection_point=checkout_info.checkout.collection_point,
-            shipping_address=address,
-            lines=lines,
-            shipping_channel_listings=shipping_channel_listings,
-        )
+        checkout_info.shipping_address = address
         updated_fields = ["shipping_address", "last_change"]
+    if checkout.save_shipping_address != store_in_user_addresses:
+        checkout.save_shipping_address = store_in_user_addresses
+        updated_fields.append("save_shipping_address")
     return updated_fields
 
 
@@ -529,7 +553,7 @@ def _get_shipping_voucher_discount_for_checkout(
     if not is_shipping_required(lines):
         msg = "Your order does not require shipping."
         raise NotApplicable(msg)
-    shipping_method = checkout_info.delivery_method_info.delivery_method
+    shipping_method = checkout_info.get_delivery_method_info().delivery_method
     if not shipping_method:
         msg = "Please select a delivery method first."
         raise NotApplicable(msg)
@@ -923,7 +947,7 @@ def remove_voucher_from_checkout(checkout: Checkout):
     checkout.voucher_code = None
     checkout.discount_name = None
     checkout.translated_discount_name = None
-    checkout.discount_amount = Decimal("0")
+    checkout.discount_amount = Decimal(0)
     checkout.save(
         update_fields=[
             "voucher_code",
@@ -936,28 +960,37 @@ def remove_voucher_from_checkout(checkout: Checkout):
     )
 
 
-def get_valid_internal_shipping_methods_for_checkout(
+def get_valid_internal_shipping_methods_for_checkout_info(
     checkout_info: "CheckoutInfo",
-    lines: list["CheckoutLineInfo"],
     subtotal: "Money",
-    shipping_channel_listings: Iterable["ShippingMethodChannelListing"],
-    country_code: str | None = None,
-    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
 ) -> list[ShippingMethodData]:
-    if not is_shipping_required(lines):
+    if not is_shipping_required(checkout_info.lines):
         return []
     if not checkout_info.shipping_address:
         return []
 
+    country_code = (
+        checkout_info.shipping_address.country.code
+        if checkout_info.shipping_address
+        else None
+    )
+
     shipping_methods = ShippingMethod.objects.using(
-        database_connection_name
+        checkout_info.database_connection_name
     ).applicable_shipping_methods_for_instance(
         checkout_info.checkout,
         channel_id=checkout_info.checkout.channel_id,
         price=subtotal,
         shipping_address=checkout_info.shipping_address,
         country_code=country_code,
-        lines=lines,
+        lines=checkout_info.lines,
+    )
+
+    shipping_channel_listings = ShippingMethodChannelListing.objects.using(
+        checkout_info.database_connection_name
+    ).filter(
+        channel_id=checkout_info.channel.id,
+        shipping_method_id__in=[method.pk for method in shipping_methods],
     )
 
     channel_listings_map = {
@@ -1003,29 +1036,23 @@ def get_valid_collection_points_for_checkout(
     )
 
 
-def clear_delivery_method(checkout_info: "CheckoutInfo"):
+def clear_cc_delivery_method(
+    checkout_info: "CheckoutInfo", save: bool = True
+) -> list[str]:
     checkout = checkout_info.checkout
-    checkout.collection_point = None
-    checkout.shipping_method = None
-    checkout_info.shipping_method = None
+    if checkout.collection_point_id is None:
+        return []
+    updated_fields = remove_click_and_collect_from_checkout(checkout)
 
-    update_delivery_method_lists_for_checkout_info(
-        checkout_info=checkout_info,
-        shipping_method=None,
-        collection_point=None,
-        shipping_address=checkout_info.shipping_address,
-        lines=checkout_info.lines,
-        shipping_channel_listings=checkout_info.shipping_channel_listings,
-    )
+    if "collection_point_id" in updated_fields:
+        checkout_info.shipping_address = checkout_info.checkout.shipping_address
 
-    checkout.save(
-        update_fields=[
-            "shipping_method",
-            "collection_point",
-            "last_change",
-        ]
-    )
-    delete_external_shipping_id_if_present(checkout=checkout)
+    if updated_fields:
+        updated_fields.append("last_change")
+        if save:
+            checkout.safe_update(updated_fields)
+
+    return updated_fields
 
 
 def is_fully_paid(
@@ -1071,52 +1098,7 @@ def is_shipping_required(lines: list["CheckoutLineInfo"]):
     return any(line_info.product_type.is_shipping_required for line_info in lines)
 
 
-def validate_variants_in_checkout_lines(lines: list["CheckoutLineInfo"]):
-    variants_listings_map = {line.variant.id: line.channel_listing for line in lines}
-
-    not_available_variants = [
-        variant_id
-        for variant_id, channel_listing in variants_listings_map.items()
-        if channel_listing is None or channel_listing.price is None
-    ]
-    if not_available_variants:
-        not_available_variants_ids = {
-            graphene.Node.to_global_id("ProductVariant", pk)
-            for pk in not_available_variants
-        }
-        error_code = CheckoutErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL.value
-        raise ValidationError(
-            {
-                "lines": ValidationError(
-                    "Cannot add lines with unavailable variants.",
-                    code=error_code,
-                    params={"variants": not_available_variants_ids},
-                )
-            }
-        )
-
-
-def set_external_shipping_id(checkout: Checkout, app_shipping_id: str):
-    metadata = get_or_create_checkout_metadata(checkout)
-    metadata.store_value_in_private_metadata(
-        {PRIVATE_META_APP_SHIPPING_ID: app_shipping_id}
-    )
-    metadata.save()
-
-
-def get_external_shipping_id(container: Union["Checkout", "Order"]):
-    metadata_object: ModelWithMetadata | None
-    if isinstance(container, Checkout):
-        metadata_object = get_checkout_metadata(container)
-    else:
-        metadata_object = container
-    if not metadata_object:
-        return None
-    return metadata_object.get_value_from_private_metadata(PRIVATE_META_APP_SHIPPING_ID)
-
-
-def delete_external_shipping_id_if_present(checkout: Checkout):
-    """Delete external shipping key if present in metadata."""
+def _remove_external_shipping_from_metadata(checkout: Checkout):
     metadata = get_checkout_metadata(checkout)
     if not metadata:
         return
@@ -1128,9 +1110,116 @@ def delete_external_shipping_id_if_present(checkout: Checkout):
         metadata.save(update_fields=["private_metadata"])
 
 
+def _remove_undiscounted_base_shipping_price(checkout: Checkout):
+    if checkout.undiscounted_base_shipping_price_amount:
+        checkout.undiscounted_base_shipping_price_amount = Decimal(0)
+        return ["undiscounted_base_shipping_price_amount"]
+    return []
+
+
+def remove_shipping_method_from_checkout(checkout: Checkout) -> list[str]:
+    fields_to_update = []
+    if checkout.assigned_delivery_id:
+        checkout.assigned_delivery_id = None
+        fields_to_update.append("assigned_delivery_id")
+        if checkout.shipping_method_name is not None:
+            checkout.shipping_method_name = None
+            fields_to_update.append("shipping_method_name")
+    return fields_to_update
+
+
+def remove_click_and_collect_from_checkout(checkout: Checkout) -> list[str]:
+    fields_to_update = []
+    if checkout.collection_point_id:
+        checkout.collection_point_id = None
+        fields_to_update.append("collection_point_id")
+        if checkout.shipping_address_id:
+            checkout.shipping_address = None
+            # reset the save_shipping_address flag to the default value
+            checkout.save_shipping_address = True
+            fields_to_update.extend(["shipping_address_id", "save_shipping_address"])
+    return fields_to_update
+
+
+def remove_delivery_method_from_checkout(checkout: Checkout) -> list[str]:
+    fields_to_update = []
+    fields_to_update += _remove_undiscounted_base_shipping_price(checkout)
+    fields_to_update += remove_shipping_method_from_checkout(checkout)
+    fields_to_update += remove_click_and_collect_from_checkout(checkout)
+    return fields_to_update
+
+
+def _assign_undiscounted_base_shipping_price_to_checkout(
+    checkout, checkout_delivery: CheckoutDelivery
+):
+    current_shipping_price = quantize_price(
+        checkout.undiscounted_base_shipping_price, checkout.currency
+    )
+    new_shipping_price = quantize_price(checkout_delivery.price, checkout.currency)
+    if current_shipping_price != new_shipping_price:
+        checkout.undiscounted_base_shipping_price_amount = new_shipping_price.amount
+        return ["undiscounted_base_shipping_price_amount"]
+    return []
+
+
+def assign_shipping_method_to_checkout(
+    checkout: Checkout, checkout_delivery: CheckoutDelivery
+) -> list[str]:
+    fields_to_update = []
+    fields_to_update += remove_click_and_collect_from_checkout(checkout)
+    fields_to_update += _assign_undiscounted_base_shipping_price_to_checkout(
+        checkout, checkout_delivery
+    )
+    if checkout.assigned_delivery_id != checkout_delivery.id:
+        checkout.assigned_delivery = checkout_delivery
+        fields_to_update.append("assigned_delivery_id")
+
+    # make sure that we don't have obsolete data for shipping methods stored in
+    # private metadata
+    _remove_external_shipping_from_metadata(checkout=checkout)
+
+    if checkout.shipping_method_name != checkout_delivery.name:
+        checkout.shipping_method_name = checkout_delivery.name
+        fields_to_update.append("shipping_method_name")
+
+    return fields_to_update
+
+
+def assign_collection_point_to_checkout(
+    checkout, collection_point: Warehouse
+) -> list[str]:
+    fields_to_update = []
+    fields_to_update += _remove_undiscounted_base_shipping_price(checkout)
+    fields_to_update += remove_shipping_method_from_checkout(checkout)
+    if checkout.collection_point_id != collection_point.id:
+        checkout.collection_point_id = collection_point.id
+        fields_to_update.append("collection_point_id")
+    if checkout.shipping_address != collection_point.address:
+        checkout.shipping_address = collection_point.address.get_copy()
+        checkout.save_shipping_address = False
+        fields_to_update.extend(["shipping_address_id", "save_shipping_address"])
+
+    return fields_to_update
+
+
 @allow_writer()
-def create_checkout_metadata(checkout: "Checkout"):
-    return CheckoutMetadata.objects.create(checkout=checkout)
+def create_checkout_metadata(
+    checkout: "Checkout",
+    *,
+    metadata: MetadataItemCollection | None,
+    private_metadata: MetadataItemCollection | None,
+) -> CheckoutMetadata:
+    checkout_metadata = CheckoutMetadata(checkout=checkout)
+
+    if metadata:
+        store_on_instance(metadata, checkout_metadata, MetadataType.PUBLIC)
+
+    if private_metadata:
+        store_on_instance(private_metadata, checkout_metadata, MetadataType.PRIVATE)
+
+    checkout_metadata.save()
+
+    return checkout_metadata
 
 
 @allow_writer()
@@ -1182,7 +1271,7 @@ def log_address_if_validation_skipped_for_checkout(
 def get_address_for_checkout_taxes(
     checkout_info: "CheckoutInfo",
 ) -> Optional["Address"]:
-    shipping_address = checkout_info.delivery_method_info.shipping_address
+    shipping_address = checkout_info.get_delivery_method_info().shipping_address
     return shipping_address or checkout_info.billing_address
 
 

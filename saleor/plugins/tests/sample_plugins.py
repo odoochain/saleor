@@ -14,6 +14,7 @@ from ...payment.interface import (
     TransactionSessionData,
     TransactionSessionResult,
 )
+from ...shipping.interface import ShippingMethodData
 from ..base_plugin import BasePlugin, ConfigurationTypeField, ExternalAccessTokens
 
 if TYPE_CHECKING:
@@ -33,7 +34,7 @@ def sample_tax_data(obj_with_lines: Union["Order", "Checkout"]) -> TaxData:
         TaxLineData(
             total_net_amount=unit * 3,
             total_gross_amount=unit_gross * 3,
-            tax_rate=Decimal("23"),
+            tax_rate=Decimal(23),
         )
         for _ in obj_with_lines.lines.all()
     ]
@@ -44,7 +45,7 @@ def sample_tax_data(obj_with_lines: Union["Order", "Checkout"]) -> TaxData:
     return TaxData(
         shipping_price_net_amount=shipping,
         shipping_price_gross_amount=shipping_gross,
-        shipping_tax_rate=Decimal("23"),
+        shipping_tax_rate=Decimal(23),
         lines=lines,
     )
 
@@ -122,7 +123,7 @@ class PluginSample(BasePlugin):
         previous_value: TaxedMoney,
     ):
         # See if delivery method doesn't trigger infinite recursion
-        bool(checkout_info.delivery_method_info.delivery_method)
+        bool(checkout_info.get_delivery_method_info().delivery_method)
 
         price = Money("1.0", currency=checkout_info.checkout.currency)
         return TaxedMoney(price, price)
@@ -268,6 +269,7 @@ class PluginSample(BasePlugin):
     def get_order_line_tax_rate(
         self,
         order: "Order",
+        order_line: "OrderLine",
         product: "Product",
         variant: "ProductVariant",
         address: Optional["Address"],
@@ -338,6 +340,9 @@ class PluginSample(BasePlugin):
     def checkout_fully_paid(self, checkout, previous_value, webhooks):
         return None
 
+    def checkout_fully_authorized(self, checkout, previous_value, webhooks):
+        return None
+
     def order_fully_refunded(self, order, previous_value, webhooks):
         return None
 
@@ -365,6 +370,27 @@ class PluginSample(BasePlugin):
 
     def payment_method_process_tokenization(self, request_data, previous_value):
         return previous_value
+
+    def get_shipping_methods_for_checkout(
+        self,
+        checkout: "Checkout",
+        built_in_shipping_methods: list["ShippingMethodData"],
+        previous_value: Any,
+    ) -> list["ShippingMethodData"]:
+        different_currency = "EUR"
+        assert checkout.currency != different_currency
+        return [
+            ShippingMethodData(
+                id="123",
+                price=Money(Decimal(10), currency=different_currency),
+                name="EUR shipping",
+            ),
+            ShippingMethodData(
+                id="123",
+                price=Money(Decimal(10), currency=checkout.currency),
+                name="Default shipping",
+            ),
+        ]
 
 
 class ChannelPluginSample(PluginSample):

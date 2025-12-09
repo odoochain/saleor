@@ -3,7 +3,14 @@ from django.core.exceptions import ValidationError
 
 from ....checkout.checkout_cleaner import validate_checkout
 from ....checkout.complete_checkout import create_order_from_checkout
-from ....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from ....checkout.fetch import (
+    CheckoutInfo,
+    CheckoutLineInfo,
+    fetch_checkout_info,
+    fetch_checkout_lines,
+    get_or_fetch_checkout_deliveries,
+)
+from ....checkout.utils import is_shipping_required
 from ....core.exceptions import GiftCardNotApplicable, InsufficientStock
 from ....core.taxes import TaxDataError
 from ....discount.models import NotApplicable
@@ -11,11 +18,12 @@ from ....permission.enums import CheckoutPermissions
 from ....webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.doc_category import DOC_CATEGORY_ORDERS
 from ...core.mutations import BaseMutation
 from ...core.types import Error, NonNullList
 from ...core.utils import CHECKOUT_CALCULATE_TAXES_MESSAGE, WebhookEventInfo
-from ...meta.inputs import MetadataInput
+from ...meta.inputs import MetadataInput, MetadataInputDescription
 from ...order.types import Order
 from ...plugins.dataloaders import get_plugin_manager_promise
 from ..enums import OrderCreateFromCheckoutErrorCode
@@ -59,12 +67,14 @@ class OrderCreateFromCheckout(BaseMutation):
         )
         private_metadata = NonNullList(
             MetadataInput,
-            description=("Fields required to update the checkout private metadata."),
+            description="Fields required to update the checkout private metadata. "
+            f"{MetadataInputDescription.PRIVATE_METADATA_INPUT}",
             required=False,
         )
         metadata = NonNullList(
             MetadataInput,
-            description=("Fields required to update the checkout metadata."),
+            description="Fields required to update the checkout metadata. "
+            f"{MetadataInputDescription.PUBLIC_METADATA_INPUT}",
             required=False,
         )
 
@@ -135,13 +145,31 @@ class OrderCreateFromCheckout(BaseMutation):
         ]
 
     @classmethod
-    def check_permissions(cls, context, permissions=None, **data):
+    def check_permissions(cls, context, permissions=None, **data):  # type: ignore[override]
         """Determine whether app has rights to perform this mutation."""
         permissions = permissions or cls._meta.permissions
         app = getattr(context, "app", None)
         if app:
             return app.has_perms(permissions)
         return False
+
+    @classmethod
+    def validate_checkout(
+        cls,
+        checkout_info: CheckoutInfo,
+        checkout_lines: list[CheckoutLineInfo],
+        unavailable_variant_pks: list[int],
+        manager,
+    ):
+        if is_shipping_required(checkout_lines) and checkout_info.assigned_delivery:
+            # Refresh stale shipping if needed
+            get_or_fetch_checkout_deliveries(checkout_info)
+        validate_checkout(
+            checkout_info=checkout_info,
+            lines=checkout_lines,
+            unavailable_variant_pks=unavailable_variant_pks,
+            manager=manager,
+        )
 
     @classmethod
     def perform_mutation(  # type: ignore[override]
@@ -166,20 +194,21 @@ class OrderCreateFromCheckout(BaseMutation):
 
         if cls._meta.support_meta_field and metadata is not None:
             cls.check_metadata_permissions(info, id)
-            cls.validate_metadata_keys(metadata)
+            cls.create_metadata_from_graphql_input(
+                metadata, error_field_name="metadata"
+            )
         if cls._meta.support_private_meta_field and private_metadata is not None:
             cls.check_metadata_permissions(info, id, private=True)
-            cls.validate_metadata_keys(private_metadata)
+            cls.create_metadata_from_graphql_input(
+                metadata, error_field_name="private_metadata"
+            )
 
         manager = get_plugin_manager_promise(info.context).get()
         checkout_lines, unavailable_variant_pks = fetch_checkout_lines(checkout)
         checkout_info = fetch_checkout_info(checkout, checkout_lines, manager)
 
-        validate_checkout(
-            checkout_info=checkout_info,
-            lines=checkout_lines,
-            unavailable_variant_pks=unavailable_variant_pks,
-            manager=manager,
+        cls.validate_checkout(
+            checkout_info, checkout_lines, unavailable_variant_pks, manager
         )
         app = get_app_promise(info.context).get()
         try:
@@ -213,4 +242,4 @@ class OrderCreateFromCheckout(BaseMutation):
                 code=OrderCreateFromCheckoutErrorCode.TAX_ERROR.value,
             ) from e
 
-        return OrderCreateFromCheckout(order=order)
+        return OrderCreateFromCheckout(order=SyncWebhookControlContext(order))

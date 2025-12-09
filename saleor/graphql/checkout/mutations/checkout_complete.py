@@ -1,7 +1,7 @@
 import graphene
 from django.core.exceptions import ValidationError
 
-from ....checkout import AddressType
+from ....checkout import AddressType, models
 from ....checkout.checkout_cleaner import (
     clean_checkout_shipping,
     validate_checkout_email,
@@ -13,6 +13,7 @@ from ....checkout.fetch import (
     CheckoutLineInfo,
     fetch_checkout_info,
     fetch_checkout_lines,
+    get_or_fetch_checkout_deliveries,
 )
 from ....checkout.utils import is_shipping_required
 from ....order import models as order_models
@@ -21,6 +22,7 @@ from ....webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ...account.i18n import I18nMixin
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
 from ...core.descriptions import DEPRECATED_IN_3X_INPUT
 from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.fields import JSONString
@@ -29,7 +31,7 @@ from ...core.scalars import UUID
 from ...core.types import CheckoutError, NonNullList
 from ...core.utils import CHECKOUT_CALCULATE_TAXES_MESSAGE, WebhookEventInfo
 from ...core.validators import validate_one_of_args_is_in_mutation
-from ...meta.inputs import MetadataInput
+from ...meta.inputs import MetadataInput, MetadataInputDescription
 from ...order.types import Order
 from ...plugins.dataloaders import get_plugin_manager_promise
 from ...site.dataloaders import get_site_promise
@@ -91,7 +93,8 @@ class CheckoutComplete(BaseMutation, I18nMixin):
         )
         metadata = NonNullList(
             MetadataInput,
-            description=("Fields required to update the checkout metadata."),
+            description="Fields required to update the checkout metadata. "
+            f"{MetadataInputDescription.PUBLIC_METADATA_INPUT}",
             required=False,
         )
 
@@ -183,6 +186,9 @@ class CheckoutComplete(BaseMutation, I18nMixin):
         billing_address = checkout_info.billing_address
 
         if is_shipping_required(lines):
+            if checkout_info.assigned_delivery:
+                # Refresh stale shipping if needed
+                get_or_fetch_checkout_deliveries(checkout_info)
             clean_checkout_shipping(checkout_info, lines, CheckoutErrorCode)
             if shipping_address:
                 shipping_address_data = shipping_address.as_data()
@@ -267,7 +273,9 @@ class CheckoutComplete(BaseMutation, I18nMixin):
                 # checkoutComplete response. Order is anonymized for not logged in
                 # user
                 return CheckoutComplete(
-                    order=order, confirmation_needed=False, confirmation_data={}
+                    order=SyncWebhookControlContext(order),
+                    confirmation_needed=False,
+                    confirmation_data={},
                 )
             raise e
         if metadata is not None:
@@ -275,7 +283,9 @@ class CheckoutComplete(BaseMutation, I18nMixin):
                 info,
                 id or checkout_id or graphene.Node.to_global_id("Checkout", token),
             )
-            cls.validate_metadata_keys(metadata)
+            cls.create_metadata_from_graphql_input(
+                metadata, error_field_name="metadata"
+            )
 
         validate_checkout_email(checkout)
 
@@ -306,7 +316,26 @@ class CheckoutComplete(BaseMutation, I18nMixin):
             )
         checkout_info = fetch_checkout_info(checkout, lines, manager)
 
-        cls.validate_checkout_addresses(checkout_info, lines)
+        try:
+            cls.validate_checkout_addresses(checkout_info, lines)
+        except models.Checkout.DoesNotExist as e:
+            order = order_models.Order.objects.get_by_checkout_token(
+                checkout_info.checkout.token
+            )
+            if order:
+                return CheckoutComplete(
+                    order=SyncWebhookControlContext(order),
+                    confirmation_needed=False,
+                    confirmation_data={},
+                )
+            raise ValidationError(
+                {
+                    "checkout": ValidationError(
+                        "Checkout does not exist anymore.",
+                        code=CheckoutErrorCode.NOT_FOUND.value,
+                    )
+                }
+            ) from e
 
         requestor = get_user_or_app_from_context(info.context)
         if requestor and requestor.has_perm(AccountPermissions.IMPERSONATE_USER):
@@ -334,7 +363,7 @@ class CheckoutComplete(BaseMutation, I18nMixin):
         # If gateway returns information that additional steps are required we need
         # to inform the frontend and pass all required data
         return CheckoutComplete(
-            order=order,
+            order=SyncWebhookControlContext(order) if order else None,
             confirmation_needed=action_required,
             confirmation_data=action_data,
         )

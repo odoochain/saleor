@@ -11,8 +11,6 @@ import graphene
 import pytest
 from celery.exceptions import MaxRetriesExceededError
 from celery.exceptions import Retry as CeleryTaskRetryError
-from django.contrib.auth.tokens import default_token_generator
-from django.contrib.sites.models import Site
 from django.core.serializers import serialize
 from freezegun import freeze_time
 from kombu.asynchronous.aws.sqs.connection import AsyncSQSConnection
@@ -30,15 +28,16 @@ from ....core import EventDeliveryStatus
 from ....core.models import EventDelivery, EventDeliveryAttempt, EventPayload
 from ....core.notification.utils import get_site_context
 from ....core.notify import NotifyEventType
+from ....core.tokens import token_generator
 from ....core.utils.url import prepare_url
-from ....discount import RewardType, RewardValueType
+from ....discount import DiscountType, DiscountValueType, RewardType, RewardValueType
 from ....discount.interface import VariantPromotionRuleInfo
 from ....discount.utils.checkout import (
     create_or_update_discount_objects_from_promotion_for_checkout,
 )
 from ....graphql.discount.enums import DiscountValueTypeEnum
 from ....graphql.discount.utils import convert_migrated_sale_predicate_to_catalogue_info
-from ....graphql.order.tests.mutations.test_order_discount import ORDER_DISCOUNT_ADD
+from ....graphql.order.tests.mutations.test_order_discount import ORDER_DISCOUNT_UPDATE
 from ....graphql.product.tests.mutations.test_product_create import (
     CREATE_PRODUCT_MUTATION,
 )
@@ -1101,7 +1100,7 @@ def test_checkout_payload_includes_promotions(
     variant = checkout_lines[0].variant
     channel_listing = variant.channel_listings.first()
 
-    reward_value = Decimal("5")
+    reward_value = Decimal(5)
     rule = catalogue_promotion_without_rules.rules.create(
         name="Percentage promotion rule",
         catalogue_predicate={
@@ -1166,7 +1165,7 @@ def test_checkout_payload_includes_order_promotion_discount(
     variant = checkout_lines[0].variant
     channel_listing = variant.channel_listings.first()
 
-    reward_value = Decimal("5")
+    reward_value = Decimal(5)
     rule = catalogue_promotion_without_rules.rules.create(
         name="Fixed promotion rule",
         order_predicate={
@@ -1258,6 +1257,40 @@ def test_checkout_fully_paid(
     mocked_webhook_trigger.assert_called_once_with(
         None,
         WebhookEventAsyncType.CHECKOUT_FULLY_PAID,
+        [any_webhook],
+        checkout_with_items,
+        None,
+        legacy_data_generator=ANY,
+        allow_replica=False,
+        queue=settings.CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
+    )
+    assert isinstance(
+        mocked_webhook_trigger.call_args.kwargs["legacy_data_generator"], partial
+    )
+
+
+@freeze_time("2014-06-28 10:50")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_checkout_fully_authorized(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    settings,
+    checkout_with_items,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+    manager = get_plugins_manager(allow_replica=False)
+
+    # when
+    manager.checkout_fully_authorized(checkout_with_items)
+
+    # then
+    mocked_webhook_trigger.assert_called_once_with(
+        None,
+        WebhookEventAsyncType.CHECKOUT_FULLY_AUTHORIZED,
         [any_webhook],
         checkout_with_items,
         None,
@@ -1685,7 +1718,7 @@ def test_notify_user(
     redirect_url = "http://redirect.com/"
     send_account_confirmation(customer_user, redirect_url, manager, channel_USD.slug)
 
-    token = default_token_generator.make_token(customer_user)
+    token = token_generator.make_token(customer_user)
     params = urlencode({"email": customer_user.email, "token": token})
     confirm_url = prepare_url(params, redirect_url)
 
@@ -1910,7 +1943,7 @@ def test_sale_toggle(
     )
 
 
-@mock.patch("saleor.plugins.webhook.plugin.send_webhook_request_async.delay")
+@mock.patch("saleor.plugins.webhook.plugin.send_webhook_request_async.apply_async")
 def test_event_delivery_retry(mocked_webhook_send, event_delivery, settings):
     # given
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
@@ -1920,7 +1953,11 @@ def test_event_delivery_retry(mocked_webhook_send, event_delivery, settings):
     manager.event_delivery_retry(event_delivery)
 
     # then
-    mocked_webhook_send.assert_called_once_with(event_delivery.pk)
+    mocked_webhook_send.assert_called_once_with(
+        kwargs={"event_delivery_id": event_delivery.pk, "telemetry_context": ANY},
+        queue=settings.WEBHOOK_CELERY_QUEUE_NAME,
+        MessageGroupId="example.com:saleorapptest",
+    )
 
 
 @mock.patch(
@@ -1951,7 +1988,7 @@ def test_send_webhook_request_async_with_success_response(
     # then
     mocked_send_response.assert_called_once_with(
         event_delivery.webhook.target_url,
-        "mirumee.com",
+        "example.com",
         event_delivery.webhook.secret_key,
         event_delivery.event_type,
         event_delivery.payload.get_payload().encode("utf-8"),
@@ -2090,7 +2127,7 @@ def test_transaction_charge_requested(
         available_actions=["capture", "void"],
         currency="USD",
         order_id=order.pk,
-        authorized_value=Decimal("10"),
+        authorized_value=Decimal(10),
         app_identifier=app.identifier,
         app=app,
     )
@@ -2143,7 +2180,7 @@ def test_transaction_refund_requested(
         ],
         currency="USD",
         order_id=order.pk,
-        authorized_value=Decimal("10"),
+        authorized_value=Decimal(10),
         app_identifier=app.identifier,
         app=app,
     )
@@ -2198,7 +2235,7 @@ def test_transaction_refund_requested_missing_app_owner_updated_refundable_for_c
         ],
         currency="USD",
         checkout_id=checkout.pk,
-        authorized_value=Decimal("10"),
+        authorized_value=Decimal(10),
         app_identifier=app.identifier,
         app=app,
     )
@@ -2250,7 +2287,7 @@ def test_transaction_cancel_requested_missing_app_owner_updated_refundable_for_c
         ],
         currency="USD",
         checkout_id=checkout.pk,
-        authorized_value=Decimal("10"),
+        authorized_value=Decimal(10),
         app_identifier=app.identifier,
         app=app,
     )
@@ -2300,7 +2337,7 @@ def test_transaction_cancelation_requested(
         ],
         currency="USD",
         order_id=order.pk,
-        authorized_value=Decimal("10"),
+        authorized_value=Decimal(10),
         app_identifier=app.identifier,
         app=app,
     )
@@ -2362,7 +2399,7 @@ def test_send_webhook_request_async_with_request_exception(
     event_payload = event_delivery.payload
     data = event_payload.get_payload()
     webhook = event_delivery.webhook
-    domain = Site.objects.get_current().domain
+    domain = "example.com"
     message = data.encode("utf-8")
     signature = signature_for_payload(message, webhook.secret_key)
     expected_request_headers = generate_request_headers(
@@ -2446,17 +2483,27 @@ def test_trigger_webhook_sync_with_subscription_within_mutation_use_default_db(
     webhook = subscription_calculate_taxes_for_order
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     mocked_get_webhooks_for_event.return_value = [webhook]
+
+    order_discount = draft_order.discounts.create(
+        value_type=DiscountValueType.FIXED,
+        value=Decimal(10),
+        amount_value=Decimal(10),
+        currency=draft_order.currency,
+        type=DiscountType.MANUAL,
+    )
+
     variables = {
-        "orderId": graphene.Node.to_global_id("Order", draft_order.pk),
+        "discountId": graphene.Node.to_global_id("OrderDiscount", order_discount.pk),
         "input": {
             "valueType": DiscountValueTypeEnum.PERCENTAGE.name,
-            "value": Decimal("50"),
+            "value": Decimal(50),
         },
     }
+
     app_api_client.app.permissions.add(permission_manage_orders)
 
     # when
-    app_api_client.post_graphql(ORDER_DISCOUNT_ADD, variables)
+    app_api_client.post_graphql(ORDER_DISCOUNT_UPDATE, variables)
 
     # then
     mocked_generate_payload.assert_called_once()

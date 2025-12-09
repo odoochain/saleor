@@ -15,7 +15,6 @@ from ...discount.models import (
 )
 from ...graphql.shop.types import Shop
 from ...menu.models import MenuItemTranslation
-from ...order.utils import get_all_shipping_methods_for_order
 from ...page.models import PageTranslation
 from ...payment.interface import (
     ListStoredPaymentMethodsRequestData,
@@ -38,15 +37,18 @@ from ...webhook.const import MAX_FILTERABLE_CHANNEL_SLUGS_LIMIT
 from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ..account.types import User as UserType
 from ..app.types import App as AppType
-from ..channel import ChannelContext
-from ..channel.dataloaders import ChannelByIdLoader
 from ..channel.enums import TransactionFlowStrategyEnum
 from ..core import ResolveInfo
-from ..core.context import get_database_connection_name
+from ..core.context import (
+    ChannelContext,
+    SyncWebhookControlContext,
+    get_database_connection_name,
+)
 from ..core.descriptions import (
     ADDED_IN_318,
     ADDED_IN_319,
     ADDED_IN_320,
+    ADDED_IN_321,
     DEPRECATED_IN_3X_EVENT,
     PREVIEW_FEATURE,
 )
@@ -70,13 +72,10 @@ from ..order.dataloaders import OrderByIdLoader
 from ..order.types import Order, OrderGrantedRefund
 from ..payment.enums import TokenizedPaymentFlowEnum, TransactionActionEnum
 from ..payment.types import TransactionItem
-from ..plugins.dataloaders import plugin_manager_promise_callback
 from ..product.dataloaders import ProductVariantByIdLoader
-from ..shipping.dataloaders import ShippingMethodChannelListingByChannelSlugLoader
 from ..shipping.types import ShippingMethod
 from ..translations import types as translation_types
 from ..warehouse.dataloaders import WarehouseByIdLoader
-from .resolvers import resolve_shipping_methods_for_checkout
 
 TRANSLATIONS_TYPES_MAP = {
     ProductTranslation: translation_types.ProductTranslation,
@@ -356,7 +355,7 @@ class AttributeBase(AbstractType):
     @staticmethod
     def resolve_attribute(root, _info: ResolveInfo):
         _, attribute = root
-        return attribute
+        return ChannelContext(attribute, None)
 
 
 class AttributeCreated(SubscriptionObjectType, AttributeBase):
@@ -391,8 +390,8 @@ class AttributeValueBase(AbstractType):
 
     @staticmethod
     def resolve_attribute_value(root, _info: ResolveInfo):
-        _, attribute = root
-        return attribute
+        _, attribute_value = root
+        return ChannelContext(attribute_value, None)
 
 
 class AttributeValueCreated(SubscriptionObjectType, AttributeValueBase):
@@ -516,7 +515,7 @@ class OrderBase(AbstractType):
     @staticmethod
     def resolve_order(root, info: ResolveInfo):
         _, order = root
-        return order
+        return SyncWebhookControlContext(order)
 
 
 class OrderCreated(SubscriptionObjectType, OrderBase):
@@ -618,7 +617,7 @@ class OrderBulkCreated(SubscriptionObjectType):
     @staticmethod
     def resolve_orders(root, _info: ResolveInfo):
         _, orders = root
-        return orders
+        return [SyncWebhookControlContext(order) for order in orders]
 
     class Meta:
         root_type = None
@@ -1240,7 +1239,15 @@ class InvoiceBase(AbstractType):
     @staticmethod
     def resolve_order(root, _info):
         _, invoice = root
-        return OrderByIdLoader(_info.context).load(invoice.order_id)
+
+        def _wrap_with_sync_webhook_control_context(order):
+            return SyncWebhookControlContext(order)
+
+        return (
+            OrderByIdLoader(_info.context)
+            .load(invoice.order_id)
+            .then(_wrap_with_sync_webhook_control_context)
+        )
 
 
 class InvoiceRequested(SubscriptionObjectType, InvoiceBase):
@@ -1286,12 +1293,12 @@ class FulfillmentBase(AbstractType):
     @staticmethod
     def resolve_fulfillment(root, _info: ResolveInfo):
         _, fulfillment = root
-        return fulfillment
+        return SyncWebhookControlContext(node=fulfillment)
 
     @staticmethod
     def resolve_order(root, info: ResolveInfo):
         _, fulfillment = root
-        return fulfillment.order
+        return SyncWebhookControlContext(node=fulfillment.order)
 
 
 class FulfillmentTrackingNumberUpdated(SubscriptionObjectType, FulfillmentBase):
@@ -1305,7 +1312,7 @@ class FulfillmentTrackingNumberUpdated(SubscriptionObjectType, FulfillmentBase):
 
 class FulfillmentCreated(SubscriptionObjectType, FulfillmentBase):
     notify_customer = graphene.Boolean(
-        description=("If true, the app should send a notification to the customer."),
+        description="If true, the app should send a notification to the customer.",
         required=True,
     )
 
@@ -1319,12 +1326,12 @@ class FulfillmentCreated(SubscriptionObjectType, FulfillmentBase):
     @staticmethod
     def resolve_fulfillment(root, info: ResolveInfo):
         _, data = root
-        return data["fulfillment"]
+        return SyncWebhookControlContext(node=data["fulfillment"])
 
     @staticmethod
     def resolve_order(root, info: ResolveInfo):
         _, data = root
-        return data["fulfillment"].order
+        return SyncWebhookControlContext(node=data["fulfillment"].order)
 
     @staticmethod
     def resolve_notify_customer(root, _info: ResolveInfo):
@@ -1356,12 +1363,12 @@ class FulfillmentApproved(SubscriptionObjectType, FulfillmentBase):
     @staticmethod
     def resolve_fulfillment(root, info: ResolveInfo):
         _, data = root
-        return data["fulfillment"]
+        return SyncWebhookControlContext(node=data["fulfillment"])
 
     @staticmethod
     def resolve_order(root, info: ResolveInfo):
         _, data = root
-        return data["fulfillment"].order
+        return SyncWebhookControlContext(node=data["fulfillment"].order)
 
     @staticmethod
     def resolve_notify_customer(root, _info: ResolveInfo):
@@ -1469,7 +1476,7 @@ class CheckoutBase(AbstractType):
     @staticmethod
     def resolve_checkout(root, _info: ResolveInfo):
         _, checkout = root
-        return checkout
+        return SyncWebhookControlContext(node=checkout)
 
 
 class CheckoutCreated(SubscriptionObjectType, CheckoutBase):
@@ -1494,11 +1501,25 @@ class CheckoutFullyPaid(SubscriptionObjectType, CheckoutBase):
         enable_dry_run = True
         interfaces = (Event,)
         description = (
-            "Event sent when checkout is fully paid with transactions."
-            " The checkout is considered as fully paid when the checkout "
-            "`charge_status` is `FULL` or `OVERCHARGED`. "
-            "The event is not sent when the checkout authorization flow strategy "
-            "is used."
+            "Event sent when a checkout was fully paid. A checkout is "
+            "considered fully paid when its `chargeStatus` is `FULL` "
+            "or `OVERCHARGED`. This event is not sent if payments are only "
+            "authorized but not fully charged."
+            "\n\nIt is triggered only for checkouts whose payments are "
+            "processed through the Transaction API."
+        )
+
+
+class CheckoutFullyAuthorized(SubscriptionObjectType, CheckoutBase):
+    class Meta:
+        root_type = "Checkout"
+        enable_dry_run = True
+        interfaces = (Event,)
+        description = (
+            "Event sent when a checkout was fully authorized. A checkout is "
+            "considered fully authorized when its `authorizeStatus` is `FULL`."
+            "\n\nIt is triggered only for checkouts whose payments are processed through "
+            "the Transaction API."
         )
 
 
@@ -1518,7 +1539,7 @@ class PageBase(AbstractType):
     @staticmethod
     def resolve_page(root, _info: ResolveInfo):
         _, page = root
-        return page
+        return ChannelContext(page, channel_slug=None)
 
 
 class PageCreated(SubscriptionObjectType, PageBase):
@@ -1758,7 +1779,8 @@ class TransactionAction(SubscriptionObjectType, AbstractType):
         description="Determines the action type.",
     )
     amount = PositiveDecimal(
-        description="Transaction request amount. Null when action type is VOID.",
+        description="Transaction request amount.",
+        required=True,
     )
     currency = graphene.String(
         description="Currency code.",
@@ -1770,9 +1792,7 @@ class TransactionAction(SubscriptionObjectType, AbstractType):
 
     @staticmethod
     def resolve_amount(root: TransactionActionData, _info: ResolveInfo):
-        if root.action_value is not None:
-            return quantize_price(root.action_value, root.transaction.currency)
-        return None
+        return quantize_price(root.action_value, root.transaction.currency)
 
     @staticmethod
     def resolve_currency(root: TransactionActionData, _info: ResolveInfo):
@@ -1829,7 +1849,7 @@ class TransactionRefundRequested(TransactionActionBase, SubscriptionObjectType):
     def resolve_granted_refund(root, _info: ResolveInfo):
         _, transaction_action_data = root
         transaction_action_data: TransactionActionData
-        return transaction_action_data.granted_refund
+        return SyncWebhookControlContext(transaction_action_data.granted_refund)
 
 
 class TransactionCancelationRequested(TransactionActionBase, SubscriptionObjectType):
@@ -1865,7 +1885,7 @@ class PaymentGatewayInitializeSession(SubscriptionObjectType):
     def resolve_source_object(root, _info: ResolveInfo):
         _, objects = root
         source_object, _, _ = objects
-        return source_object
+        return SyncWebhookControlContext(node=source_object)
 
     @staticmethod
     def resolve_data(root, _info: ResolveInfo):
@@ -1933,7 +1953,7 @@ class TransactionSessionBase(SubscriptionObjectType, AbstractType):
         cls, root: tuple[str, TransactionSessionData], _info: ResolveInfo
     ):
         _, transaction_session_data = root
-        return transaction_session_data.source_object
+        return SyncWebhookControlContext(node=transaction_session_data.source_object)
 
     @classmethod
     def resolve_data(cls, root: tuple[str, TransactionSessionData], _info: ResolveInfo):
@@ -1964,7 +1984,7 @@ class TransactionSessionBase(SubscriptionObjectType, AbstractType):
 
 class TransactionInitializeSession(TransactionSessionBase):
     idempotency_key = graphene.String(
-        description=("Idempotency key assigned to the transaction initialize."),
+        description="Idempotency key assigned to the transaction initialize.",
         required=True,
     )
 
@@ -2454,13 +2474,18 @@ class ShippingListMethodsForCheckout(SubscriptionObjectType, CheckoutBase):
     )
 
     @staticmethod
-    @plugin_manager_promise_callback
-    def resolve_shipping_methods(root, info: ResolveInfo, manager):
-        _, checkout = root
-        database_connection_name = get_database_connection_name(info.context)
-        return resolve_shipping_methods_for_checkout(
-            info, checkout, manager, database_connection_name
-        )
+    def resolve_checkout(root, _info: ResolveInfo):
+        _, data = root
+        checkout, _ = data
+        return SyncWebhookControlContext(node=checkout)
+
+    @staticmethod
+    def resolve_shipping_methods(root, info: ResolveInfo):
+        # We should only use internal shipping methods to prevent the generation of circular payloads.
+        # We aren't able to list shipping methods that are not internal for listing shipping methods webhook type.
+        _, data = root
+        _, built_in_shipping_methods = data
+        return built_in_shipping_methods
 
     class Meta:
         root_type = None
@@ -2495,13 +2520,16 @@ class CheckoutFilterShippingMethods(SubscriptionObjectType, CheckoutBase):
     )
 
     @staticmethod
-    @plugin_manager_promise_callback
-    def resolve_shipping_methods(root, info: ResolveInfo, manager):
-        _, checkout = root
-        database_connection_name = get_database_connection_name(info.context)
-        return resolve_shipping_methods_for_checkout(
-            info, checkout, manager, database_connection_name
-        )
+    def resolve_checkout(root, _info: ResolveInfo):
+        _, data = root
+        checkout, _ = data
+        return SyncWebhookControlContext(node=checkout)
+
+    @staticmethod
+    def resolve_shipping_methods(root, _info: ResolveInfo):
+        _, data = root
+        _, shipping_methods = data
+        return shipping_methods
 
     class Meta:
         root_type = None
@@ -2518,20 +2546,16 @@ class OrderFilterShippingMethods(SubscriptionObjectType, OrderBase):
     )
 
     @staticmethod
+    def resolve_order(root, info: ResolveInfo):
+        _, data = root
+        order, _ = data
+        return SyncWebhookControlContext(order)
+
+    @staticmethod
     def resolve_shipping_methods(root, info: ResolveInfo):
-        _, order = root
-
-        def with_channel(channel):
-            def with_listings(channel_listings):
-                return get_all_shipping_methods_for_order(order, channel_listings)
-
-            return (
-                ShippingMethodChannelListingByChannelSlugLoader(info.context)
-                .load(channel.slug)
-                .then(with_listings)
-            )
-
-        return ChannelByIdLoader(info.context).load(order.channel_id).then(with_channel)
+        _, data = root
+        _, shipping_methods = data
+        return shipping_methods
 
     class Meta:
         root_type = None
@@ -2585,16 +2609,16 @@ class WarehouseMetadataUpdated(SubscriptionObjectType, WarehouseBase):
         description = "Event sent when warehouse metadata is updated."
 
 
-def default_order_resolver(root, info, channels=None):
+def default_channel_filterable_resolver(root, info, channels=None):
     return Observable.from_([root])
 
 
 channels_argument = graphene.Argument(
     NonNullList(graphene.String),
     description=(
-        "List of channel slugs. The event will be sent only if the order "
+        "List of channel slugs. The event will be sent only if the object "
         "belongs to one of the provided channels. If the channel slug list is "
-        "empty, orders that belong to any channel will be sent. Maximally "
+        "empty, objects that belong to any channel will be sent. Maximally "
         f"{MAX_FILTERABLE_CHANNEL_SLUGS_LIMIT} items."
     ),
 )
@@ -2612,7 +2636,7 @@ class Subscription(SubscriptionObjectType):
             + ADDED_IN_320
             + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2621,7 +2645,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when draft order is updated." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2630,7 +2654,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when draft order is deleted." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2639,7 +2663,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when new order is created." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2648,7 +2672,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order is updated." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2657,7 +2681,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order is confirmed." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2668,7 +2692,7 @@ class Subscription(SubscriptionObjectType):
             + ADDED_IN_320
             + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2677,7 +2701,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order is fully paid." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2687,14 +2711,14 @@ class Subscription(SubscriptionObjectType):
             "The order received a refund. The order may be partially or fully "
             "refunded." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
     order_fully_refunded = BaseField(
         OrderFullyRefunded,
         description=("The order is fully refunded." + ADDED_IN_320 + PREVIEW_FEATURE),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2703,7 +2727,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order is fulfilled." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2712,7 +2736,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order is cancelled." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2721,7 +2745,7 @@ class Subscription(SubscriptionObjectType):
         description=(
             "Event sent when order becomes expired." + ADDED_IN_320 + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2732,7 +2756,7 @@ class Subscription(SubscriptionObjectType):
             + ADDED_IN_320
             + PREVIEW_FEATURE
         ),
-        resolver=default_order_resolver,
+        resolver=default_channel_filterable_resolver,
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
     )
@@ -2743,6 +2767,56 @@ class Subscription(SubscriptionObjectType):
         ),
         channels=channels_argument,
         doc_category=DOC_CATEGORY_ORDERS,
+    )
+
+    checkout_created = BaseField(
+        CheckoutCreated,
+        description=(
+            "Event sent when new checkout is created." + ADDED_IN_321 + PREVIEW_FEATURE
+        ),
+        resolver=default_channel_filterable_resolver,
+        channels=channels_argument,
+        doc_category=DOC_CATEGORY_CHECKOUT,
+    )
+    checkout_updated = BaseField(
+        CheckoutUpdated,
+        description=(
+            "Event sent when checkout is updated." + ADDED_IN_321 + PREVIEW_FEATURE
+        ),
+        resolver=default_channel_filterable_resolver,
+        channels=channels_argument,
+        doc_category=DOC_CATEGORY_CHECKOUT,
+    )
+    checkout_fully_paid = BaseField(
+        CheckoutFullyPaid,
+        description=(
+            "Event sent when checkout is fully-paid." + ADDED_IN_321 + PREVIEW_FEATURE
+        ),
+        resolver=default_channel_filterable_resolver,
+        channels=channels_argument,
+        doc_category=DOC_CATEGORY_CHECKOUT,
+    )
+    checkout_fully_authorized = BaseField(
+        CheckoutFullyAuthorized,
+        description=(
+            "Event sent when checkout is fully authorized."
+            + ADDED_IN_321
+            + PREVIEW_FEATURE
+        ),
+        resolver=default_channel_filterable_resolver,
+        channels=channels_argument,
+        doc_category=DOC_CATEGORY_CHECKOUT,
+    )
+    checkout_metadata_updated = BaseField(
+        CheckoutMetadataUpdated,
+        description=(
+            "Event sent when checkout metadata is updated."
+            + ADDED_IN_321
+            + PREVIEW_FEATURE
+        ),
+        resolver=default_channel_filterable_resolver,
+        channels=channels_argument,
+        doc_category=DOC_CATEGORY_CHECKOUT,
     )
 
     class Meta:
@@ -2957,6 +3031,7 @@ ASYNC_WEBHOOK_TYPES_MAP = {
     WebhookEventAsyncType.COLLECTION_METADATA_UPDATED: CollectionMetadataUpdated,
     WebhookEventAsyncType.CHECKOUT_CREATED: CheckoutCreated,
     WebhookEventAsyncType.CHECKOUT_UPDATED: CheckoutUpdated,
+    WebhookEventAsyncType.CHECKOUT_FULLY_AUTHORIZED: CheckoutFullyAuthorized,
     WebhookEventAsyncType.CHECKOUT_FULLY_PAID: CheckoutFullyPaid,
     WebhookEventAsyncType.CHECKOUT_METADATA_UPDATED: CheckoutMetadataUpdated,
     WebhookEventAsyncType.PAGE_CREATED: PageCreated,

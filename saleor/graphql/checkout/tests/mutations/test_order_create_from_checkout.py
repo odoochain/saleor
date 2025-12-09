@@ -4,23 +4,28 @@ from unittest.mock import ANY, patch
 
 import graphene
 import pytest
+from django.db import transaction
 from django.db.models.aggregates import Sum
+from django.test import override_settings
 from django.utils import timezone
+from freezegun import freeze_time
 from prices import Money, TaxedMoney
 
+from .....channel import MarkAsPaidStrategy
 from .....checkout import calculations
 from .....checkout.error_codes import OrderCreateFromCheckoutErrorCode
-from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
-from .....checkout.models import Checkout, CheckoutLine
-from .....core.taxes import (
-    TaxDataError,
-    TaxDataErrorMessage,
-    TaxError,
-    zero_money,
-    zero_taxed_money,
+from .....checkout.fetch import (
+    fetch_checkout_info,
+    fetch_checkout_lines,
+    fetch_shipping_methods_for_checkout,
+    get_or_fetch_checkout_deliveries,
 )
+from .....checkout.models import Checkout, CheckoutDelivery, CheckoutLine
+from .....checkout.payment_utils import update_checkout_payment_statuses
+from .....checkout.utils import PRIVATE_META_APP_SHIPPING_ID
+from .....core.taxes import TaxDataError, TaxError, zero_money, zero_taxed_money
 from .....discount import DiscountType, DiscountValueType, RewardValueType
-from .....discount.models import CheckoutLineDiscount
+from .....discount.models import CheckoutLineDiscount, OrderLineDiscount
 from .....giftcard import GiftCardEvents
 from .....giftcard.models import GiftCard, GiftCardEvent
 from .....order import OrderOrigin, OrderStatus
@@ -28,6 +33,8 @@ from .....order.models import Fulfillment, Order
 from .....payment.model_helpers import get_subtotal
 from .....plugins.manager import PluginsManager, get_plugins_manager
 from .....product.models import ProductChannelListing, ProductVariantChannelListing
+from .....shipping.models import ShippingMethod
+from .....tests import race_condition
 from .....warehouse.models import Reservation, Stock, WarehouseClickAndCollectOption
 from .....warehouse.tests.utils import get_available_quantity_for_stock
 from ....tests.utils import assert_no_permission, get_graphql_content
@@ -41,6 +48,7 @@ mutation orderCreateFromCheckout(
         ){
         order{
             id
+            status
             token
             original
             origin
@@ -51,6 +59,24 @@ mutation orderCreateFromCheckout(
                 }
                 gross {
                     amount
+                }
+            }
+            shippingMethod {
+                id
+                name
+                metadata {
+                    key
+                    value
+                }
+            }
+            deliveryMethod {
+                ... on ShippingMethod {
+                    id
+                    name
+                    metadata {
+                        key
+                        value
+                    }
                 }
             }
         }
@@ -71,7 +97,7 @@ def test_order_from_checkout_with_inactive_channel(
     checkout_with_gift_card,
     gift_card,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     assert not gift_card.last_used_on
 
@@ -80,7 +106,7 @@ def test_order_from_checkout_with_inactive_channel(
     channel.is_active = False
     channel.save()
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -117,20 +143,26 @@ def test_order_from_checkout(
     checkout_with_gift_card,
     gift_card,
     address,
-    shipping_method,
+    address_usa,
+    checkout_delivery,
+    customer_user,
 ):
     assert not gift_card.last_used_on
 
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
-    checkout.billing_address = address
+    checkout.assigned_delivery = checkout_delivery(checkout)
+    checkout.billing_address = address_usa
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
         items={"accepted": "false"}
     )
+    checkout.user = customer_user
     checkout.save()
     checkout.metadata_storage.save()
+
+    customer_user.addresses.clear()
+    user_address_count = customer_user.addresses.count()
 
     checkout_line = checkout.lines.first()
 
@@ -181,7 +213,6 @@ def test_order_from_checkout(
 
     order_line = order.lines.first()
     line_tax_class = order_line.variant.product.tax_class
-    shipping_tax_class = shipping_method.tax_class
 
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
@@ -193,13 +224,16 @@ def test_order_from_checkout(
     assert order_line.tax_class_metadata == line_tax_class.metadata
     assert order_line.tax_class_private_metadata == line_tax_class.private_metadata
 
+    assigned_delivery = checkout.assigned_delivery
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(assigned_delivery.shipping_method_id)
     assert order.shipping_tax_rate is not None
-    assert order.shipping_tax_class_name == shipping_tax_class.name
-    assert order.shipping_tax_class_metadata == shipping_tax_class.metadata
+    assert order.shipping_tax_class.id == assigned_delivery.tax_class_id
+    assert order.shipping_tax_class_name == assigned_delivery.tax_class_name
+    assert order.shipping_tax_class_metadata == assigned_delivery.tax_class_metadata
     assert (
-        order.shipping_tax_class_private_metadata == shipping_tax_class.private_metadata
+        order.shipping_tax_class_private_metadata
+        == assigned_delivery.tax_class_private_metadata
     )
     assert order.search_vector
 
@@ -209,6 +243,8 @@ def test_order_from_checkout(
     assert GiftCardEvent.objects.filter(
         gift_card=gift_card, type=GiftCardEvents.USED_IN_ORDER
     )
+
+    assert customer_user.addresses.count() == user_address_count + 2
 
     order_confirmed_mock.assert_called_once_with(order, webhooks=set())
     recalculate_with_plugins_mock.assert_not_called()
@@ -221,12 +257,12 @@ def test_order_from_checkout_with_transaction(
     permission_handle_checkouts,
     permission_manage_checkouts,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_and_transaction_item
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -257,6 +293,60 @@ def test_order_from_checkout_with_transaction(
     assert not order.original
 
 
+def test_order_from_checkout_saving_addresses_off(
+    app_api_client,
+    site_settings,
+    checkout_with_item_and_transaction_item,
+    permission_handle_checkouts,
+    permission_manage_checkouts,
+    address,
+    checkout_delivery,
+    customer_user,
+):
+    # given
+    checkout = checkout_with_item_and_transaction_item
+    checkout.shipping_address = address
+    checkout.assigned_delivery = checkout_delivery(checkout)
+    checkout.billing_address = address
+    checkout.save_shipping_address = False
+    checkout.save_billing_address = False
+    checkout.user = customer_user
+    checkout.save()
+
+    channel = checkout.channel
+    channel.automatically_confirm_all_new_orders = True
+    channel.save()
+
+    customer_user.addresses.clear()
+    user_address_count = customer_user.addresses.count()
+
+    variables = {
+        "id": graphene.Node.to_global_id("Checkout", checkout.pk),
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts, permission_manage_checkouts],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+
+    order = Order.objects.first()
+
+    assert order.status == OrderStatus.UNFULFILLED
+    assert order.origin == OrderOrigin.CHECKOUT
+    assert not order.original
+
+    assert order.billing_address
+    assert order.shipping_address
+    assert customer_user.addresses.count() == user_address_count
+
+
 @pytest.mark.parametrize(
     ("auto_confirm", "order_status"),
     [(True, OrderStatus.UNFULFILLED), (False, OrderStatus.UNCONFIRMED)],
@@ -270,12 +360,12 @@ def test_order_from_checkout_auto_confirm_flag(
     permission_handle_checkouts,
     permission_manage_checkouts,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_and_transaction_item
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -312,12 +402,12 @@ def test_order_from_checkout_with_metadata(
     checkout_with_gift_card,
     gift_card,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -387,12 +477,12 @@ def test_order_from_checkout_with_metadata_checkout_without_metadata(
     checkout_with_gift_card,
     gift_card,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -454,12 +544,13 @@ def test_order_from_checkout_by_app_with_missing_permission(
     checkout_with_item,
     customer_user,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout_with_item
     checkout.user = customer_user
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
+
     checkout.billing_address = address
     checkout.save()
 
@@ -485,18 +576,19 @@ def test_order_from_checkout_gift_card_bought(
     permission_handle_checkouts,
     checkout_with_gift_card_items,
     address,
-    shipping_method,
+    checkout_delivery,
     payment_txn_captured,
 ):
     # given
     checkout = checkout_with_gift_card_items
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
         items={"accepted": "false"}
     )
+    checkout.email = customer_user.email
     checkout.user = customer_user
     checkout.save()
     checkout.metadata_storage.save()
@@ -566,11 +658,11 @@ def test_order_from_checkout_no_checkout_email(
     permission_handle_checkouts,
     checkout_with_gift_card,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -602,11 +694,11 @@ def test_order_from_checkout_with_variant_without_sku(
     gift_card,
     permission_handle_checkouts,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout_with_item
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -649,11 +741,11 @@ def test_order_from_checkout_with_variant_without_price(
     checkout_with_item,
     gift_card,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout_with_item
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -721,7 +813,7 @@ def test_order_from_checkout_with_voucher(
     checkout_with_voucher_percentage,
     voucher_percentage,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     code = voucher_percentage.codes.first()
     voucher_used_count = code.used
@@ -730,7 +822,7 @@ def test_order_from_checkout_with_voucher(
 
     checkout = checkout_with_voucher_percentage
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -767,7 +859,10 @@ def test_order_from_checkout_with_voucher(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
+
     order_discount = order.discounts.filter(type=DiscountType.VOUCHER).first()
     assert order_discount
     assert (
@@ -792,6 +887,7 @@ def test_order_from_checkout_with_voucher_and_gift_card(
     gift_card,
     address,
     shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout_with_voucher_percentage.gift_cards.add(gift_card)
@@ -799,7 +895,7 @@ def test_order_from_checkout_with_voucher_and_gift_card(
     shipping_listing = shipping_method.channel_listings.get(
         channel_id=checkout_with_voucher_percentage.channel_id
     )
-    shipping_listing.price_amount = Decimal("35")
+    shipping_listing.price_amount = Decimal(35)
     shipping_listing.save(update_fields=["price_amount"])
 
     code = voucher_percentage.codes.first()
@@ -809,7 +905,7 @@ def test_order_from_checkout_with_voucher_and_gift_card(
 
     checkout = checkout_with_voucher_percentage
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout, shipping_method)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -858,7 +954,9 @@ def test_order_from_checkout_with_voucher_and_gift_card(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
     order_discount = order.discounts.filter(type=DiscountType.VOUCHER).first()
     assert order_discount
     assert (
@@ -888,7 +986,7 @@ def test_order_from_checkout_with_voucher_apply_once_per_order(
     checkout_with_voucher_percentage,
     voucher_percentage,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     code = voucher_percentage.codes.first()
     voucher_used_count = code.used
@@ -903,7 +1001,7 @@ def test_order_from_checkout_with_voucher_apply_once_per_order(
     checkout_line_variant = checkout_line.variant
 
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -946,16 +1044,18 @@ def test_order_from_checkout_with_voucher_apply_once_per_order(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
-    order_discount = order.discounts.filter(type=DiscountType.VOUCHER).first()
-    assert order_discount
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
+    order_line_discount = OrderLineDiscount.objects.get()
+    assert order_line_discount
     assert (
-        order_discount.amount_value
+        order_line_discount.amount_value
         == (order.undiscounted_total - order.total).gross.amount
     )
-    assert order_discount.type == DiscountType.VOUCHER
-    assert order_discount.voucher == voucher_percentage
-    assert order_discount.voucher_code == code.code
+    assert order_line_discount.type == DiscountType.VOUCHER
+    assert order_line_discount.voucher == voucher_percentage
+    assert order_line_discount.voucher_code == code.code
 
     code.refresh_from_db()
     assert code.used == voucher_used_count + 1
@@ -968,7 +1068,7 @@ def test_order_from_checkout_with_specific_product_voucher(
     checkout_with_item_and_voucher_specific_products,
     voucher_specific_product_type,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     code = voucher_specific_product_type.codes.first()
     voucher_used_count = code.used
@@ -977,7 +1077,7 @@ def test_order_from_checkout_with_specific_product_voucher(
 
     checkout = checkout_with_item_and_voucher_specific_products
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -1013,16 +1113,19 @@ def test_order_from_checkout_with_specific_product_voucher(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
-    order_discount = order.discounts.filter(type=DiscountType.VOUCHER).first()
-    assert order_discount
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
+
+    order_line_discount = OrderLineDiscount.objects.get()
+    assert order_line_discount
     assert (
-        order_discount.amount_value
+        order_line_discount.amount_value
         == (order.undiscounted_total - order.total).gross.amount
     )
-    assert order_discount.type == DiscountType.VOUCHER
-    assert order_discount.voucher == voucher_specific_product_type
-    assert order_discount.voucher_code == code.code
+    assert order_line_discount.type == DiscountType.VOUCHER
+    assert order_line_discount.voucher == voucher_specific_product_type
+    assert order_line_discount.voucher_code == code.code
 
     code.refresh_from_db()
     assert code.used == voucher_used_count + 1
@@ -1036,6 +1139,7 @@ def test_order_from_checkout_with_free_shipping_voucher_and_gift_card(
     voucher_percentage,
     gift_card,
     address,
+    checkout_delivery,
     shipping_method,
 ):
     # given
@@ -1045,7 +1149,7 @@ def test_order_from_checkout_with_free_shipping_voucher_and_gift_card(
     shipping_listing = shipping_method.channel_listings.get(
         channel_id=checkout.channel_id
     )
-    shipping_amount = Decimal("35")
+    shipping_amount = Decimal(35)
     shipping_listing.price_amount = shipping_amount
     shipping_listing.save(update_fields=["price_amount"])
 
@@ -1057,7 +1161,7 @@ def test_order_from_checkout_with_free_shipping_voucher_and_gift_card(
     voucher_percentage.save(update_fields=["usage_limit"])
 
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout, shipping_method)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -1070,7 +1174,7 @@ def test_order_from_checkout_with_free_shipping_voucher_and_gift_card(
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
 
-    shipping_price = shipping_listing.price
+    shipping_price = checkout.assigned_delivery.price
 
     orders_count = Order.objects.count()
     variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
@@ -1104,7 +1208,9 @@ def test_order_from_checkout_with_free_shipping_voucher_and_gift_card(
     assert checkout_line_quantity == order_line.quantity
     assert checkout_line_variant == order_line.variant
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
     order_discount = order.discounts.filter(type=DiscountType.VOUCHER).first()
     assert order_discount
     assert order_discount.amount_value == shipping_amount
@@ -1132,7 +1238,7 @@ def test_order_from_checkout_voucher_not_increase_uses_on_preprocess_creation_fa
     checkout_with_voucher_percentage,
     voucher_percentage,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     mocked_preprocess_order_creation.side_effect = TaxError("tax error!")
     code = voucher_percentage.codes.first()
@@ -1143,7 +1249,7 @@ def test_order_from_checkout_voucher_not_increase_uses_on_preprocess_creation_fa
 
     checkout = checkout_with_voucher_percentage
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1212,12 +1318,12 @@ def test_order_from_checkout_on_catalogue_promotion(
     permission_manage_checkouts,
     permission_manage_orders,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_on_promotion
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1274,12 +1380,12 @@ def test_order_from_checkout_on_order_promotion(
     permission_manage_checkouts,
     permission_manage_orders,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_and_order_discount
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1331,12 +1437,12 @@ def test_order_from_checkout_on_gift_promotion(
     permission_manage_checkouts,
     permission_manage_orders,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_and_gift_promotion
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
     line_count = checkout.lines.count()
@@ -1395,12 +1501,12 @@ def test_order_from_checkout_on_catalogue_and_gift_promotion(
     permission_handle_checkouts,
     permission_manage_checkouts,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_item_on_promotion
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1488,11 +1594,9 @@ def test_order_from_checkout_without_inventory_tracking(
     permission_handle_checkouts,
     checkout_with_variant_without_inventory_tracking,
     address,
-    shipping_method,
 ):
     checkout = checkout_with_variant_without_inventory_tracking
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -1508,7 +1612,7 @@ def test_order_from_checkout_without_inventory_tracking(
     manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, manager)
-    total = calculations.checkout_total(
+    total = calculations.calculate_checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
     )
 
@@ -1537,7 +1641,9 @@ def test_order_from_checkout_without_inventory_tracking(
     assert checkout_line_variant == order_line.variant
     assert not order_line.allocations.all()
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
 
 
 def test_order_from_checkout_checkout_without_lines(
@@ -1546,11 +1652,11 @@ def test_order_from_checkout_checkout_without_lines(
     permission_handle_checkouts,
     checkout,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -1586,7 +1692,7 @@ def test_order_from_checkout_insufficient_stock(
     app_api_client,
     checkout_with_item,
     address,
-    shipping_method,
+    checkout_delivery,
     permission_handle_checkouts,
 ):
     checkout = checkout_with_item
@@ -1596,7 +1702,7 @@ def test_order_from_checkout_insufficient_stock(
     checkout_line.quantity = quantity_available + 1
     checkout_line.save()
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1619,7 +1725,7 @@ def test_order_from_checkout_insufficient_stock_reserved_by_other_user(
     permission_handle_checkouts,
     checkout_with_item,
     address,
-    shipping_method,
+    checkout_delivery,
     channel_USD,
 ):
     checkout = checkout_with_item
@@ -1645,7 +1751,7 @@ def test_order_from_checkout_insufficient_stock_reserved_by_other_user(
     checkout_line.quantity = 1
     checkout_line.save()
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1670,7 +1776,7 @@ def test_order_from_checkout_own_reservation(
     permission_handle_checkouts,
     checkout_with_item,
     address,
-    shipping_method,
+    checkout_delivery,
     channel_USD,
 ):
     checkout = checkout_with_item
@@ -1681,7 +1787,7 @@ def test_order_from_checkout_own_reservation(
     checkout_line.quantity = quantity_available
     checkout_line.save()
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -1723,16 +1829,17 @@ def test_order_from_checkout_with_digital(
     permission_handle_checkouts,
     checkout_with_digital_item,
     address,
+    customer_user,
 ):
     """Ensure it is possible to complete a digital checkout without shipping."""
 
-    order_count = Order.objects.count()
     checkout = checkout_with_digital_item
     variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
 
     # Set a billing address
     checkout.billing_address = address
-    checkout.save(update_fields=["billing_address"])
+    checkout.user = customer_user
+    checkout.save(update_fields=["billing_address", "user"])
 
     # Send the creation request
     response = app_api_client.post_graphql(
@@ -1743,10 +1850,100 @@ def test_order_from_checkout_with_digital(
     content = get_graphql_content(response)["data"]["orderCreateFromCheckout"]
     assert not content["errors"]
 
+    order = Order.objects.first()
     # Ensure the order was actually created
-    assert Order.objects.count() == order_count + 1, (
-        "The order should have been created"
+    assert order, "The order should have been created"
+
+    assert not order.shipping_address
+    assert order.billing_address
+
+
+def test_order_from_checkout_with_digital_and_shipping_address(
+    app_api_client,
+    permission_handle_checkouts,
+    checkout_with_digital_item,
+    address,
+    customer_user,
+):
+    """Ensure it is possible to complete a digital checkout without shipping."""
+    checkout = checkout_with_digital_item
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    # Set a billing address
+    checkout.billing_address = address
+    checkout.shipping_address = address
+    checkout.user = customer_user
+    checkout.save(update_fields=["billing_address", "shipping_address", "user"])
+
+    # Send the creation request
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts],
     )
+    content = get_graphql_content(response)["data"]["orderCreateFromCheckout"]
+    assert not content["errors"]
+
+    order = Order.objects.first()
+    # Ensure the order was actually created
+    assert order, "The order should have been created"
+
+    assert order.shipping_address
+    assert order.billing_address
+    assert order.draft_save_billing_address is None
+    assert order.draft_save_shipping_address is None
+
+
+def test_order_from_checkout_with_digital_saving_addresses_off(
+    app_api_client,
+    permission_handle_checkouts,
+    checkout_with_digital_item,
+    address,
+    customer_user,
+):
+    # given
+    checkout = checkout_with_digital_item
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    # Set a billing address
+    checkout.billing_address = address
+    checkout.shipping_address = address
+    checkout.user = customer_user
+    checkout.save_shipping_address = False
+    checkout.save_billing_address = False
+    checkout.save(
+        update_fields=[
+            "billing_address",
+            "shipping_address",
+            "user",
+            "save_shipping_address",
+            "save_billing_address",
+        ]
+    )
+
+    customer_user.addresses.clear()
+    user_address_count = customer_user.addresses.count()
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+
+    # then
+    content = get_graphql_content(response)["data"]["orderCreateFromCheckout"]
+    assert not content["errors"]
+
+    order = Order.objects.first()
+    # Ensure the order was actually created
+    assert order, "The order should have been created"
+
+    assert order.shipping_address
+    assert order.billing_address
+    assert order.draft_save_billing_address is None
+    assert order.draft_save_shipping_address is None
+    assert customer_user.addresses.count() == user_address_count
 
 
 @pytest.mark.integration
@@ -1756,7 +1953,7 @@ def test_order_from_checkout_0_total_value(
     gift_card,
     permission_handle_checkouts,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     assert not gift_card.last_used_on
 
@@ -1781,12 +1978,10 @@ def test_order_from_checkout_0_total_value(
     checkout_line_variant.price_amount = Decimal(0)
     checkout_line_variant.save()
 
-    checkout.refresh_from_db()
-
     manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, manager)
-    total = calculations.checkout_total(
+    total = calculations.calculate_checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
     )
 
@@ -2001,7 +2196,7 @@ def test_order_from_checkout_raises_invalid_shipping_method_when_warehouse_disab
     checkout_info = fetch_checkout_info(checkout, lines, manager)
 
     assert not checkout_info.valid_pick_up_points
-    assert not checkout_info.delivery_method_info.is_method_in_valid_methods(
+    assert not checkout_info.get_delivery_method_info().is_method_in_valid_methods(
         checkout_info
     )
 
@@ -2028,11 +2223,11 @@ def test_order_from_draft_create_with_preorder_variant(
     permission_handle_checkouts,
     checkout_with_item_and_preorder_item,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     checkout = checkout_with_item_and_preorder_item
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.save()
 
@@ -2073,7 +2268,9 @@ def test_order_from_draft_create_with_preorder_variant(
     for variant_id, quantity in variants_and_quantities.items():
         assert order.lines.get(variant_id=variant_id).quantity == quantity
     assert order.shipping_address == address
-    assert order.shipping_method == checkout.shipping_method
+    assert order.shipping_method.id == int(
+        checkout.assigned_delivery.shipping_method_id
+    )
 
     preorder_line = order.lines.filter(variant__is_preorder=True).first()
     assert not preorder_line.allocations.exists()
@@ -2131,7 +2328,7 @@ def test_order_from_draft_create_click_collect_preorder_fails_for_disabled_wareh
     checkout_info = fetch_checkout_info(checkout, lines, manager)
 
     assert not checkout_info.valid_pick_up_points
-    assert not checkout_info.delivery_method_info.is_method_in_valid_methods(
+    assert not checkout_info.get_delivery_method_info().is_method_in_valid_methods(
         checkout_info
     )
 
@@ -2161,14 +2358,14 @@ def test_order_from_checkout_create_when_line_without_listing(
     listing_filter_field,
     checkout_with_items,
     address,
-    shipping_method,
+    checkout_delivery,
     app_api_client,
     permission_handle_checkouts,
 ):
     # given
     checkout = checkout_with_items
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -2220,12 +2417,12 @@ def test_order_from_draft_create_variant_channel_listing_no_price(
     permission_handle_checkouts,
     checkout_with_items,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_items
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -2277,12 +2474,12 @@ def test_order_from_draft_create_product_channel_listing_does_not_exist(
     permission_handle_checkouts,
     checkout_with_items,
     address,
-    shipping_method,
+    checkout_delivery,
 ):
     # given
     checkout = checkout_with_items
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -2334,13 +2531,13 @@ def test_order_from_draft_create_product_channel_listing_not_available_for_purch
     permission_handle_checkouts,
     checkout_with_items,
     address,
-    shipping_method,
+    checkout_delivery,
     available_for_purchase,
 ):
     # given
     checkout = checkout_with_items
     checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
+    checkout.assigned_delivery = checkout_delivery(checkout)
     checkout.billing_address = address
     checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
     checkout.metadata_storage.store_value_in_private_metadata(
@@ -2390,7 +2587,7 @@ def test_order_from_draft_create_0_total_value_from_voucher(
     app_api_client,
     permission_handle_checkouts,
     checkout_without_shipping_required,
-    shipping_method,
+    checkout_delivery,
     address,
     voucher,
 ):
@@ -2409,8 +2606,6 @@ def test_order_from_draft_create_0_total_value_from_voucher(
     checkout_line = checkout.lines.first()
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
-
-    checkout.refresh_from_db()
 
     manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
@@ -2471,8 +2666,6 @@ def test_order_from_draft_create_0_total_value_from_giftcard(
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
 
-    checkout.refresh_from_db()
-
     manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, manager)
@@ -2509,16 +2702,18 @@ def test_order_from_draft_create_0_total_value_from_giftcard(
     )
 
 
-@patch("saleor.checkout.calculations.validate_tax_data")
+@patch(
+    "saleor.checkout.calculations._get_taxes_for_checkout",
+    side_effect=TaxDataError("Invalid data"),
+)
 def test_order_from_checkout_tax_error(
-    mock_validate_tax_data,
+    mocked_get_taxes_for_order,
     app_api_client,
     permission_handle_checkouts,
     checkout_with_items_and_shipping,
     caplog,
 ):
     # given
-    mock_validate_tax_data.side_effect = TaxDataError(TaxDataErrorMessage.EMPTY)
     checkout = checkout_with_items_and_shipping
     variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
 
@@ -2536,3 +2731,549 @@ def test_order_from_checkout_tax_error(
     assert data["errors"][0]["field"] is None
     assert not Order.objects.exists()
     assert "Tax app error for checkout" in caplog.text
+
+
+def test_order_from_checkout_with_transaction_empty_product_translation(
+    app_api_client,
+    site_settings,
+    checkout_with_item,
+    permission_handle_checkouts,
+    permission_manage_checkouts,
+    address,
+    checkout_delivery,
+):
+    # given
+    checkout = checkout_with_item
+    checkout.shipping_address = address
+    checkout.assigned_delivery = checkout_delivery(checkout)
+    checkout.billing_address = address
+    checkout.save()
+
+    checkout_line = checkout.lines.first()
+    checkout_line_variant = checkout_line.variant
+    checkout_line_product = checkout_line_variant.product
+    checkout_line_product.translations.create(language_code="en")
+    checkout_line_variant.translations.create(language_code="en")
+
+    variables = {
+        "id": graphene.Node.to_global_id("Checkout", checkout.pk),
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts, permission_manage_checkouts],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+
+    order = Order.objects.first()
+
+    assert order.status == OrderStatus.UNCONFIRMED
+    assert order.origin == OrderOrigin.CHECKOUT
+    assert not order.original
+
+    order_line = order.lines.first()
+    assert order_line.translated_product_name == ""
+    assert order_line.translated_variant_name == ""
+
+
+def test_order_from_checkout_with_translation_equal_name(
+    app_api_client,
+    site_settings,
+    checkout_with_item,
+    permission_handle_checkouts,
+    permission_manage_checkouts,
+    address,
+    checkout_delivery,
+):
+    # given
+    checkout = checkout_with_item
+    checkout.shipping_address = address
+    checkout.assigned_delivery = checkout_delivery(checkout)
+    checkout.billing_address = address
+    checkout.save()
+
+    checkout_line = checkout.lines.first()
+    checkout_line_variant = checkout_line.variant
+    checkout_line_product = checkout_line_variant.product
+    checkout_line_product.name = "Product name"
+    checkout_line_product.save()
+    checkout_line_variant.name = "Variant name"
+    checkout_line_variant.save()
+    product_translation = checkout_line_product.translations.create(
+        language_code=checkout.language_code, name=checkout_line_product.name
+    )
+    variant_translation = checkout_line_variant.translations.create(
+        language_code=checkout.language_code, name=checkout_line_variant.name
+    )
+
+    variables = {
+        "id": graphene.Node.to_global_id("Checkout", checkout.pk),
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts, permission_manage_checkouts],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+
+    order = Order.objects.first()
+    order_line = order.lines.first()
+    assert order_line.translated_product_name == product_translation.name
+    assert order_line.translated_variant_name == variant_translation.name
+
+
+def test_order_from_checkout_order_status_changed_after_creation(
+    checkout_with_item_total_0,
+    customer_user,
+    app_api_client,
+    permission_handle_checkouts,
+):
+    """Ensure order status is valid in the mutation response.
+
+    In case that order is created with `UNCONFIRMED` and then changed into `UNFULFILLED`
+    in post commit action, the returned order status should be upt-to-date.
+    """
+    # given
+    checkout = checkout_with_item_total_0
+
+    channel = checkout.channel
+    channel.order_mark_as_paid_strategy = MarkAsPaidStrategy.TRANSACTION_FLOW
+    channel.save(update_fields=["order_mark_as_paid_strategy"])
+
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.save()
+
+    update_checkout_payment_statuses(
+        checkout, zero_money(checkout.currency), checkout_has_lines=True
+    )
+
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    def immediate_on_commit(func):
+        func()
+
+    # when
+    with patch.object(transaction, "on_commit", side_effect=immediate_on_commit):
+        response = app_api_client.post_graphql(
+            MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+            variables,
+            permissions=[permission_handle_checkouts],
+        )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+
+    order = data["order"]
+    assert order
+    assert order["status"] == OrderStatus.UNFULFILLED.upper()
+
+
+@patch(
+    "saleor.graphql.checkout.mutations.order_create_from_checkout."
+    "get_or_fetch_checkout_deliveries",
+    wraps=get_or_fetch_checkout_deliveries,
+)
+def test_order_from_checkout_refreshes_shipping_methods_when_stale(
+    mocked_get_or_fetch_checkout_deliveries,
+    app_api_client,
+    permission_handle_checkouts,
+    site_settings,
+    checkout_ready_to_complete,
+    gift_card,
+    address,
+    address_usa,
+    customer_user,
+):
+    # given
+    checkout = checkout_ready_to_complete
+    checkout.delivery_methods_stale_at = timezone.now()
+    checkout.save(update_fields=["delivery_methods_stale_at"])
+
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+
+    assert not data["errors"]
+    assert mocked_get_or_fetch_checkout_deliveries.called
+
+
+@freeze_time("2023-01-01 12:00:00")
+@patch(
+    "saleor.checkout.fetch.fetch_shipping_methods_for_checkout",
+    wraps=fetch_shipping_methods_for_checkout,
+)
+def test_order_from_checkout_do_not_refresh_shipping_methods_when_not_stale(
+    mocked_fetch_checkout_deliveries,
+    app_api_client,
+    permission_handle_checkouts,
+    site_settings,
+    checkout_ready_to_complete,
+    gift_card,
+    address,
+    address_usa,
+    customer_user,
+):
+    # given
+    checkout = checkout_ready_to_complete
+    checkout.delivery_methods_stale_at = timezone.now() + datetime.timedelta(hours=1)
+    checkout.save(update_fields=["delivery_methods_stale_at"])
+
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+
+    assert not data["errors"]
+    assert not mocked_fetch_checkout_deliveries.called
+
+
+@freeze_time("2023-01-01 12:00:00")
+@patch(
+    "saleor.graphql.checkout.mutations.order_create_from_checkout."
+    "get_or_fetch_checkout_deliveries",
+    wraps=get_or_fetch_checkout_deliveries,
+)
+def test_order_from_checkout_refreshes_shipping_methods_when_stale_and_invalid(
+    mocked_get_or_fetch_checkout_deliveries,
+    app_api_client,
+    permission_handle_checkouts,
+    site_settings,
+    checkout_ready_to_complete,
+    gift_card,
+    address,
+    address_usa,
+    customer_user,
+):
+    # given
+    checkout = checkout_ready_to_complete
+    checkout.delivery_methods_stale_at = timezone.now()
+    checkout.save(update_fields=["delivery_methods_stale_at"])
+
+    # Shipping is not available anymore
+    ShippingMethod.objects.all().delete()
+
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+    new_now_time = timezone.now() + datetime.timedelta(hours=16)
+
+    # when
+    with freeze_time(new_now_time):
+        response = app_api_client.post_graphql(
+            MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+            variables,
+            permissions=[permission_handle_checkouts],
+        )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["orderCreateFromCheckout"]
+    assert data["errors"]
+    assert (
+        data["errors"][0]["code"]
+        == OrderCreateFromCheckoutErrorCode.INVALID_SHIPPING_METHOD.name
+    )
+
+    assert Order.objects.count() == 0
+    assert mocked_get_or_fetch_checkout_deliveries.called
+
+
+@pytest.mark.integration
+@override_settings(
+    PLUGINS=[
+        "saleor.plugins.webhook.plugin.WebhookPlugin",
+    ]
+)
+@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+def test_order_from_checkout_with_external_shipping(
+    mocked_sync_webhook,
+    app_api_client,
+    permission_handle_checkouts,
+    checkout_with_item,
+    address,
+    shipping_app,
+):
+    # given
+    external_shipping_method_id = "ABC"
+    external_shipping_name = "Provider - Economy"
+    external_shipping_metadata_key = "external_metadata_key"
+    external_shipping_metadata_value = "external_metadata_value"
+    external_shipping_metadata = {
+        external_shipping_metadata_key: external_shipping_metadata_value
+    }
+    graphql_external_method_id = graphene.Node.to_global_id(
+        "app", f"{shipping_app.id}:{external_shipping_method_id}"
+    )
+    mock_json_response = [
+        {
+            "id": external_shipping_method_id,
+            "name": external_shipping_name,
+            "amount": "10",
+            "currency": "USD",
+            "maximum_delivery_days": "7",
+            "metadata": external_shipping_metadata,
+        }
+    ]
+    mocked_sync_webhook.return_value = mock_json_response
+
+    checkout = checkout_with_item
+    checkout.assigned_delivery = CheckoutDelivery.objects.create(
+        checkout=checkout,
+        external_shipping_method_id=graphql_external_method_id,
+        name=external_shipping_name,
+        price_amount="10.00",
+        currency="USD",
+        maximum_delivery_days=7,
+        is_external=True,
+    )
+    checkout.shipping_address = address
+    checkout.billing_address = address
+    checkout.save()
+
+    # when
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+    response = app_api_client.post_graphql(
+        MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+    order = Order.objects.first()
+    assert order.shipping_method_name == external_shipping_name
+    assert (
+        order.private_metadata[PRIVATE_META_APP_SHIPPING_ID]
+        == graphql_external_method_id
+    )
+    assert data["order"]["shippingMethod"]["name"] == external_shipping_name
+    assert order.shipping_method_metadata == external_shipping_metadata
+    expected_metadata = [
+        {
+            "key": external_shipping_metadata_key,
+            "value": external_shipping_metadata_value,
+        }
+    ]
+    assert data["order"]["shippingMethod"]["metadata"] == expected_metadata
+    assert data["order"]["deliveryMethod"]["metadata"] == expected_metadata
+
+
+@pytest.mark.integration
+@override_settings(
+    PLUGINS=[
+        "saleor.plugins.webhook.plugin.WebhookPlugin",
+    ]
+)
+@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+def test_order_from_checkout_with_external_shipping_private_metadata(
+    mocked_sync_webhook,
+    app_api_client,
+    permission_handle_checkouts,
+    permission_manage_shipping,
+    checkout_with_item,
+    address,
+    shipping_app,
+):
+    mutation_order_create_from_checkout_with_private_metadata = """
+    mutation orderCreateFromCheckout(
+            $id: ID!, $metadata: [MetadataInput!], $privateMetadata: [MetadataInput!]
+        ){
+        orderCreateFromCheckout(
+                id: $id, metadata: $metadata, privateMetadata: $privateMetadata
+            ){
+            order{
+                id
+                shippingMethod {
+                    id
+                    name
+                    privateMetadata {
+                        key
+                        value
+                    }
+                }
+                deliveryMethod {
+                    ... on ShippingMethod {
+                        id
+                        name
+                        privateMetadata {
+                            key
+                            value
+                        }
+                    }
+                }
+            }
+            errors{
+                field
+                message
+                code
+                variants
+            }
+        }
+    }
+    """
+
+    # given
+    external_shipping_method_id = "ABC"
+    external_shipping_name = "External provider - Economy"
+    external_shipping_private_metadata_key = "external_private_metadata_key"
+    external_shipping_private_metadata_value = "external_private_metadata_value"
+    external_shipping_private_metadata = {
+        external_shipping_private_metadata_key: external_shipping_private_metadata_value
+    }
+
+    graphql_external_method_id = graphene.Node.to_global_id(
+        "app", f"{shipping_app.id}:{external_shipping_method_id}"
+    )
+    mock_json_response = [
+        {
+            "id": external_shipping_method_id,
+            "name": external_shipping_name,
+            "amount": "10",
+            "currency": "USD",
+            "maximum_delivery_days": "7",
+            "private_metadata": external_shipping_private_metadata,
+        }
+    ]
+    mocked_sync_webhook.return_value = mock_json_response
+
+    checkout = checkout_with_item
+    checkout.assigned_delivery = CheckoutDelivery.objects.create(
+        checkout=checkout,
+        external_shipping_method_id=graphql_external_method_id,
+        name=external_shipping_name,
+        price_amount="10.00",
+        currency="USD",
+        maximum_delivery_days=7,
+        is_external=True,
+    )
+    checkout.shipping_address = address
+    checkout.billing_address = address
+    checkout.save()
+
+    # when
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+    response = app_api_client.post_graphql(
+        mutation_order_create_from_checkout_with_private_metadata,
+        variables,
+        permissions=[permission_handle_checkouts, permission_manage_shipping],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+    order = Order.objects.first()
+    assert data["order"]["shippingMethod"]["name"] == external_shipping_name
+    expected_private_metadata = [
+        {
+            "key": external_shipping_private_metadata_key,
+            "value": external_shipping_private_metadata_value,
+        }
+    ]
+    assert order.shipping_method_private_metadata == external_shipping_private_metadata
+    assert (
+        data["order"]["shippingMethod"]["privateMetadata"] == expected_private_metadata
+    )
+    assert (
+        data["order"]["deliveryMethod"]["privateMetadata"] == expected_private_metadata
+    )
+
+
+@freeze_time("2023-01-01 12:00:00")
+@pytest.mark.integration
+def test_order_from_checkout_builtin_shipping_method_metadata_denormalization(
+    app_api_client,
+    permission_handle_checkouts,
+    checkout_with_item,
+    shipping_method,
+    address,
+    checkout_delivery,
+):
+    # given
+    checkout = checkout_with_item
+
+    expected_metadata_key = "AnyKey"
+    expected_metadata_value = "AnyValue"
+    expected_shipping_metadata = {
+        expected_metadata_key: expected_metadata_value,
+    }
+    assigned_delivery = checkout_delivery(checkout, shipping_method)
+    assigned_delivery.metadata = expected_shipping_metadata
+    assigned_delivery.save()
+
+    checkout.shipping_address = address
+    checkout.billing_address = address
+    checkout.assigned_delivery = assigned_delivery
+    checkout.delivery_methods_stale_at = timezone.now() + datetime.timedelta(minutes=5)
+    checkout.save()
+
+    variables = {"id": graphene.Node.to_global_id("Checkout", checkout.pk)}
+
+    # when
+    def clear_shipping_metadata(*args, **kwargs):
+        # Clear shipping method metadata to ensure data is denormalized properly
+        shipping_method.metadata = {}
+        shipping_method.save()
+
+    with race_condition.RunAfter(
+        "saleor.graphql.checkout.mutations.order_create_from_checkout.create_order_from_checkout",
+        clear_shipping_metadata,
+    ):
+        response = app_api_client.post_graphql(
+            MUTATION_ORDER_CREATE_FROM_CHECKOUT,
+            variables,
+            permissions=[permission_handle_checkouts],
+        )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["orderCreateFromCheckout"]
+    assert not data["errors"]
+    order = Order.objects.first()
+    assert order.shipping_method.pk == shipping_method.pk
+
+    expected_metadata = [
+        {
+            "key": expected_metadata_key,
+            "value": expected_metadata_value,
+        }
+    ]
+    assert data["order"]["shippingMethod"]["metadata"] == expected_metadata
+    assert data["order"]["deliveryMethod"]["metadata"] == expected_metadata
+
+    # Ensure shipping metadata was denormalized properly
+    assert order.shipping_method_metadata == expected_shipping_metadata
+
+    # Ensure shipping method metadata in DB was cleared after denormalization
+    shipping_method.refresh_from_db()
+    assert shipping_method.metadata == {}
